@@ -3,6 +3,13 @@
 ## Purpose
 This file tracks what has been done, file-wise, what is pending, what needs testing, and important notes for future development. Use this as a quick reference for onboarding, resuming work, or providing context in new chats.
 
+# Recent Changes and Outstanding Tasks
+
+- **Backend**: Added `cleanAIResponse` function to robustly parse and clean AI JSON output, ensuring the `json` field is present for valid AI responses even if the model returns slightly malformed JSON. Used this function in both `/api/ai` and `/api/servers/:id/chat` endpoints.
+- **Frontend**: Attempted to enable line wrapping in the terminal by setting `lineWrap: true`, but this is not a valid xterm.js option. Noted that line wrapping is enabled by default in xterm.js, and the real solution is to use the fit addon and ensure PTY/terminal cols match.
+- **Outstanding**: Remove the invalid `lineWrap` option from `Terminal.tsx` and implement the fit addon for proper resizing and wrapping. Also, ensure the backend PTY is resized on frontend terminal resize for best results.
+- **General**: All other recent fixes for AI chat JSON display, terminal UX, and backend robustness are now in place.
+
 ---
 
 ## Backend (Node.js, Express, SQLite)
@@ -75,10 +82,19 @@ This file tracks what has been done, file-wise, what is pending, what needs test
   - 'Alternative suggestion' feature for more options
 
 ## Testing
-- [x] Test backend API endpoints (CRUD, SSH, AI)
-- [x] Test frontend flows (add server, run command, chat)
-- [x] Test with real SSH servers (use test credentials)
-- [x] Test AI integration with all three models
+- [ ] Test backend API endpoints (CRUD, SSH, AI)
+- [ ] Test frontend flows (add server, run command, chat)
+- [ ] Test with real SSH servers (use test credentials)
+- [ ] Test AI integration with all three models
+- [x] Fixed terminal context passing issue (2025-05-28)
+- [x] Improved Gemini suggestion triggering with debouncing
+- [x] Enhanced terminal prompt detection for better command logging
+
+## Recent Fixes (2025-05-28)
+- **Terminal Context Issue**: Fixed `Chat.tsx` to fetch fresh terminal history from database before AI requests
+- **Gemini Suggestions**: Added debouncing (1s) and duplicate prevention in `ServerDetail.tsx`
+- **Terminal Detection**: Improved prompt detection patterns in `Terminal.tsx` to catch more shell types
+- **Command Logging**: Terminal now persists commands to backend immediately for better sync
 
 ## Notes for Future
 - Supabase integration can be added once the npm package is available again
@@ -87,7 +103,9 @@ This file tracks what has been done, file-wise, what is pending, what needs test
 - Add user authentication and RBAC for production
 - Add file upload/download support for SSH (future)
 - Add audit logging for all actions
+- Consider adding WebSocket reconnection logic for better stability
+- Add timeout handling for long-running SSH commands
 
 ---
 
-_Last updated: 2024-06-09_ 
+_Last updated: 2025-05-28_ 

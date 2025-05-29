@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { getAISuggestion, getAIAvailability, uploadImages } from '../api/ai';
 import { getChatHistory, addChatMessage, getChatSessions } from '../api/servers';
+import axios from 'axios';
 
 const quickActions = [
   { label: 'List all files', value: 'ls -al' },
@@ -108,6 +109,20 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
   const handleSend = async () => {
     if ((!prompt && images.length === 0) || !serverId) return;
     setLoading(true);
+    
+    // Fetch latest terminal history from database before sending
+    let latestHistory = [];
+    try {
+      const historyResponse = await axios.get(`http://localhost:4000/api/servers/${serverId}/history`);
+      latestHistory = historyResponse.data || [];
+    } catch (e) {
+      console.error('Failed to fetch terminal history:', e);
+    }
+    
+    // Only include terminal context if we have recent commands
+    const hasRecentTerminalActivity = latestHistory.length > 0 && 
+      (new Date().getTime() - new Date(latestHistory[0].created_at).getTime() < 10 * 60 * 1000); // Within last 10 minutes
+    
     let imageUrls: string[] = [];
     if (images.length > 0) {
       try {
@@ -130,7 +145,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     setImagePreviews([]);
     // Always send imageUrls to backend, even if empty
     try {
-      const res = await getAISuggestion(prompt, model as 'openai' | 'gemini' | 'claude', serverId, withTerminalContext, newSession, imageUrls);
+      const res = await getAISuggestion(prompt, model as 'openai' | 'gemini' | 'claude', serverId, hasRecentTerminalActivity, newSession, imageUrls);
       await addChatMessage(serverId, 'ai', res.response);
       setHistory([...history, { role: 'user', message: userMsg, created_at: new Date().toISOString() }, { role: 'ai', message: res.response, created_at: new Date().toISOString() }]);
       setEstimatedTokens(res.estimatedTokens || null);

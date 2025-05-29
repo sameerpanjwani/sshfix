@@ -1,6 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { runSSHCommand } from '../api/ssh';
 import axios from 'axios';
+import { Terminal as XTerm } from 'xterm';
+import 'xterm/css/xterm.css';
 
 interface TerminalEntry {
   command: string;
@@ -18,86 +20,146 @@ interface TerminalProps {
   onHistoryUpdate?: (history: TerminalEntry[]) => void;
 }
 
-const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400, onGeminiSuggestion, onHistoryUpdate }) => {
-  const [command, setCommand] = useState('');
-  const [history, setHistory] = useState<TerminalEntry[]>(initialHistory);
-  const [loading, setLoading] = useState(false);
+const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, onQuickCommandUsed, panelHeight = 400, onHistoryUpdate }) => {
+  const xtermRef = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const historyRef = useRef<TerminalEntry[]>([]);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const lastQuickCommandRef = useRef<string | null>(null);
+  const pendingCommandRef = useRef<string | null>(null);
+  const wsReadyRef = useRef(false);
 
-  const handleRun = async (cmd?: string) => {
-    const toRun = cmd ?? command;
-    if (!toRun) return;
-    setLoading(true);
-    try {
-      const res = await runSSHCommand(serverId, toRun);
-      const entry = { command: toRun, output: res.output, created_at: new Date().toISOString() };
-      const newHistory = [...history, entry];
-      setHistory(newHistory);
-      if (typeof onHistoryUpdate === 'function') onHistoryUpdate(newHistory);
-      setCommand('');
-      // Call Gemini suggestion endpoint with last 3 terminal entries
-      if (res.output && typeof onGeminiSuggestion === 'function') {
-        try {
-          const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
-          // Get last 2 from history, plus the new one
-          const last2 = history.slice(-2);
-          const entries = [...last2, { command: toRun, output: res.output }];
-          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { entries, latestCommand: toRun });
-          if (suggestRes.data && suggestRes.data.response) {
-            onGeminiSuggestion(suggestRes.data);
-          }
-        } catch (err) {
-          // Ignore Gemini errors for now
-        }
-      }
-    } catch (e: any) {
-      const newHistory = [...history, { command: toRun, output: e.message, created_at: new Date().toISOString() }];
-      setHistory(newHistory);
-      if (typeof onHistoryUpdate === 'function') onHistoryUpdate(newHistory);
-    }
-    setLoading(false);
-  };
-
-  // Run quickCommand if provided
   useEffect(() => {
-    if (quickCommand) {
-      handleRun(quickCommand);
-      if (onQuickCommandUsed) onQuickCommandUsed();
+    const term = new XTerm({
+      cursorBlink: true,
+      fontFamily: 'monospace',
+      fontSize: 15,
+      theme: { background: '#181818', foreground: '#e0e0e0' },
+      rows: 24,
+      cols: 80,
+      lineWrap: true
+    });
+    xtermRef.current = term;
+    if (containerRef.current) {
+      term.open(containerRef.current);
+      term.focus();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [quickCommand]);
+    // Show connecting message
+    term.write('\x1b[33m[Connecting to SSH...]\x1b[0m\r\n');
+    // Fix WebSocket URL for dev/prod
+    const wsUrl = import.meta.env.MODE === 'development'
+      ? `ws://localhost:4000/ws/terminal?serverId=${serverId}`
+      : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/terminal?serverId=${serverId}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+    wsReadyRef.current = false;
+    let commandBuffer = '';
+    let outputBuffer = '';
+    ws.onopen = () => {
+      wsReadyRef.current = true;
+      term.write('\x1b[32m[Connected to SSH]\x1b[0m\r\n');
+      term.scrollToBottom();
+      // If there is a pending quick command, send it now
+      if (pendingCommandRef.current) {
+        term.write(pendingCommandRef.current + '\r');
+        ws.send(pendingCommandRef.current + '\n');
+        lastQuickCommandRef.current = pendingCommandRef.current;
+        if (typeof onQuickCommandUsed === 'function') onQuickCommandUsed();
+        pendingCommandRef.current = null;
+      }
+    };
+    ws.onmessage = (event) => {
+      const data = event.data;
+      term.write(data);
+      term.scrollToBottom();
+      outputBuffer += data;
+      
+      // Improved heuristic: detect command completion
+      const lines = outputBuffer.split(/\r?\n/);
+      const lastLine = lines[lines.length - 1];
+      
+      // Look for common shell prompts (more patterns)
+      const promptPatterns = [
+        /[$#%>] ?$/,           // Common Unix/Linux prompts
+        />\s*$/,               // Windows prompt
+        /\]\$\s*$/,            // Bash with brackets
+        /\]#\s*$/,             // Root with brackets
+        /❯\s*$/,               // Modern shells (zsh, fish)
+        /➜\s*$/,               // Another modern prompt
+      ];
+      
+      const hasPrompt = promptPatterns.some(pattern => pattern.test(lastLine));
+      
+      // Also check if output has been idle for a bit (backup detection)
+      if (hasPrompt && commandBuffer.trim()) {
+        // Clean up the command (remove trailing newlines/returns)
+        const cleanCommand = commandBuffer.trim().replace(/[\r\n]+$/, '');
+        
+        // Only log if we have a meaningful command
+        if (cleanCommand && cleanCommand.length > 0) {
+          const entry = { 
+            command: cleanCommand, 
+            output: outputBuffer.trim(), 
+            created_at: new Date().toISOString() 
+          };
+          
+          historyRef.current = [...historyRef.current, entry];
+          if (typeof onHistoryUpdate === 'function') onHistoryUpdate(historyRef.current);
+          
+          // Also send to backend to ensure it's persisted
+          try {
+            fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ command: cleanCommand, output: outputBuffer.trim() })
+            });
+          } catch (e) {
+            console.error('Failed to log command to backend:', e);
+          }
+        }
+        
+        commandBuffer = '';
+        outputBuffer = '';
+      }
+    };
+    ws.onclose = () => {
+      wsReadyRef.current = false;
+      term.write('\r\n\x1b[31m[Disconnected]\x1b[0m\r\n');
+      term.scrollToBottom();
+    };
+    // Send user input to backend only if WebSocket is open
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
+        commandBuffer += data;
+      }
+    });
+    return () => {
+      ws.close();
+      term.dispose();
+    };
+  }, [serverId]); // Only re-run when serverId changes
 
-  const handleClearTerminal = () => {
-    setHistory([]);
-    if (typeof onHistoryUpdate === 'function') onHistoryUpdate([]);
-  };
+  // Handle quickCommand from parent (e.g., chat quick actions)
+  useEffect(() => {
+    if (
+      quickCommand &&
+      quickCommand !== lastQuickCommandRef.current
+    ) {
+      if (wsRef.current && wsReadyRef.current && wsRef.current.readyState === WebSocket.OPEN && xtermRef.current) {
+        // Write the command to the terminal and send to backend
+        xtermRef.current.write(quickCommand + '\r');
+        wsRef.current.send(quickCommand + '\n');
+        lastQuickCommandRef.current = quickCommand;
+        if (typeof onQuickCommandUsed === 'function') onQuickCommandUsed();
+      } else {
+        // Queue the command to be sent when ws is ready
+        pendingCommandRef.current = quickCommand;
+      }
+    }
+  }, [quickCommand, onQuickCommandUsed]);
 
-  return (
-    <div style={{ background: '#181818', color: '#e0e0e0', borderRadius: 12, padding: 16, fontFamily: 'monospace', minHeight: 320, boxShadow: '0 2px 8px #0002', display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
-        <button onClick={handleClearTerminal} style={{ borderRadius: 6, background: '#fff', color: '#e53e3e', fontWeight: 700, border: '1px solid #e53e3e', padding: '4px 12px', fontSize: 13, boxShadow: '0 1px 4px #0001' }}>Clear Terminal</button>
-      </div>
-      <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, maxHeight: panelHeight }}>
-        {history.map((h, i) => (
-          <div key={i} style={{ marginBottom: 10 }}>
-            <div><span style={{ color: '#6cf' }}>$ {h.command}</span></div>
-            <div style={{ whiteSpace: 'pre-wrap', color: '#b5e853' }}>{h.output}</div>
-            <div style={{ fontSize: 10, color: '#888' }}>{new Date(h.created_at).toLocaleString()}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <input
-          style={{ flex: 1, borderRadius: 6, border: '1px solid #333', background: '#222', color: '#fff', padding: '8px 12px', fontFamily: 'monospace' }}
-          value={command}
-          onChange={e => setCommand(e.target.value)}
-          placeholder="Enter command..."
-          onKeyDown={e => { if (e.key === 'Enter') handleRun(); }}
-          disabled={loading}
-        />
-        <button style={{ borderRadius: 6, background: '#6cf', color: '#222', fontWeight: 700, padding: '8px 16px' }} onClick={() => handleRun()} disabled={loading}>{loading ? '...' : 'Run'}</button>
-      </div>
-    </div>
-  );
+  return <div ref={containerRef} id="xterm-container" style={{ width: '100%', height: '100%', background: '#181818', borderRadius: 12, overflow: 'hidden', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }} />;
 };
 
-export default Terminal; 
+export default InteractiveTerminal; 

@@ -2,7 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { getServer, getHistory, testServerConnection } from '../api/servers';
 import Chat from './Chat';
-import Terminal from './Terminal';
+import InteractiveTerminal from './Terminal';
+import axios from 'axios';
 
 const PANEL_HEIGHT = 700; // px, shared height for chat and terminal
 
@@ -69,10 +70,56 @@ const ServerDetail: React.FC = () => {
     setGeminiSuggestions(prev => [...prev, suggestion]);
   };
 
-  // Helper to get last 3 terminal entries from history
+  // Helper to get last 6 terminal entries from history
   const getLastTerminalEntries = () => {
-    return history.slice(-3);
+    return history.slice(-6);
   };
+
+  // Enhanced onHistoryUpdate: update history and fetch Gemini suggestion
+  const handleHistoryUpdate = async (newHistory: any[]) => {
+    setHistory(newHistory);
+    
+    // Debounce Gemini suggestions to avoid too many API calls
+    if (handleHistoryUpdate.timeout) {
+      clearTimeout(handleHistoryUpdate.timeout);
+    }
+    
+    handleHistoryUpdate.timeout = setTimeout(async () => {
+      // Call Gemini suggestion endpoint with last 6 entries
+      try {
+        const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
+        const entries = newHistory.slice(-6).map(e => ({
+          command: e.command || '',
+          output: (e.output || '').slice(0, 1000) // Limit output size
+        }));
+        
+        if (entries.length > 0) {
+          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { 
+            entries, 
+            latestCommand: entries[entries.length - 1].command 
+          });
+          
+          if (suggestRes.data && (suggestRes.data.response || suggestRes.data.json)) {
+            setGeminiSuggestions(prev => {
+              // Avoid duplicate suggestions
+              const lastSuggestion = prev[prev.length - 1];
+              if (lastSuggestion && lastSuggestion.response === suggestRes.data.response) {
+                return prev;
+              }
+              // Keep only last 10 suggestions to avoid memory issues
+              return [...prev.slice(-9), suggestRes.data];
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Gemini suggestion error:', err);
+        // Don't show error to user, Gemini suggestions are optional
+      }
+    }, 1000); // Wait 1 second after last update before calling API
+  };
+  
+  // Add static property for timeout
+  handleHistoryUpdate.timeout = null as any;
 
   if (loading || !server) return <div>Loading...</div>;
 
@@ -93,9 +140,9 @@ const ServerDetail: React.FC = () => {
         <div><b>Port:</b> {server.port}</div>
       </div>
       {/* Main Area */}
-      <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT }}>
+      <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT, height: PANEL_HEIGHT }}>
         {/* Chat (Left) */}
-        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16, height: PANEL_HEIGHT }}>
+        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
           <Chat
             onQuickCommand={handleQuickCommand}
             panelHeight={PANEL_HEIGHT}
@@ -109,18 +156,16 @@ const ServerDetail: React.FC = () => {
           />
         </div>
         {/* Terminal (Right) */}
-        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16, height: PANEL_HEIGHT }}>
-          <Terminal
+        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
+          <InteractiveTerminal
             serverId={Number(id)}
-            initialHistory={history}
+            panelHeight={PANEL_HEIGHT}
             quickCommand={pendingTerminalCommand || quickCommand}
             onQuickCommandUsed={() => {
               setPendingTerminalCommand(null);
               setQuickCommand(null);
             }}
-            panelHeight={PANEL_HEIGHT}
-            onGeminiSuggestion={handleGeminiSuggestion}
-            onHistoryUpdate={setHistory}
+            onHistoryUpdate={handleHistoryUpdate}
           />
         </div>
       </div>

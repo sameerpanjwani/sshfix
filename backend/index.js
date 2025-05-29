@@ -7,6 +7,7 @@ const { Client: SSHClient } = require('ssh2');
 const axios = require('axios');
 const multer = require('multer');
 const fs = require('fs');
+const WebSocket = require('ws');
 
 // Load environment variables
 dotenv.config();
@@ -173,18 +174,49 @@ app.post('/api/servers/:id/ssh', async (req, res) => {
   });
 });
 
+// --- Add this utility at the top (after requires, before endpoints) ---
+function cleanAIResponse(str) {
+  if (!str) return str;
+  // Remove code block markers
+  str = str.trim();
+  if (str.startsWith('```json')) str = str.replace(/^```json/, '').trim();
+  if (str.startsWith('```')) str = str.replace(/^```/, '').trim();
+  if (str.endsWith('```')) str = str.replace(/```$/, '').trim();
+  // Remove leading/trailing newlines
+  str = str.replace(/^[\r\n]+|[\r\n]+$/g, '');
+  // Remove trailing commas before } or ]
+  str = str.replace(/,(\s*[}\]])/g, '$1');
+  // Unescape escaped quotes (if present)
+  if (str.startsWith('"') && str.endsWith('"')) {
+    try {
+      str = JSON.parse(str);
+    } catch {}
+  }
+  return str;
+}
+
 // API: Get chat history for a server, optionally by date
 app.get('/api/servers/:id/chat', (req, res) => {
   const { date } = req.query;
   let rows;
   if (date) {
-    // Get all messages for the given date (YYYY-MM-DD)
     rows = db.prepare(`SELECT * FROM chat_history WHERE server_id = ? AND DATE(created_at) = ? ORDER BY created_at ASC`).all(req.params.id, date);
   } else {
-    // Get all messages
     rows = db.prepare(`SELECT * FROM chat_history WHERE server_id = ? ORDER BY created_at ASC`).all(req.params.id);
   }
-  res.json(rows);
+  // For AI messages, try to parse as JSON and add a 'json' field if valid
+  const result = rows.map(msg => {
+    if (msg.role === 'ai') {
+      try {
+        const parsed = JSON.parse(cleanAIResponse(msg.message));
+        if (parsed && (typeof parsed === 'object') && (parsed.answer || parsed.commands)) {
+          return { ...msg, json: parsed };
+        }
+      } catch {}
+    }
+    return msg;
+  });
+  res.json(result);
 });
 
 // API: Add chat message to history
@@ -212,7 +244,7 @@ app.post('/api/ai', async (req, res) => {
     }
     let terminalHistory = [];
     if (withTerminalContext && serverId) {
-      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 3').all(serverId);
+      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 6').all(serverId);
     }
     // Compose messages for AI API
     const messages = [];
@@ -319,7 +351,7 @@ app.post('/api/ai', async (req, res) => {
       });
       aiResponse = response.data.choices[0].message.content;
       try {
-        aiJson = JSON.parse(aiResponse);
+        aiJson = JSON.parse(cleanAIResponse(aiResponse));
       } catch (e) {
         aiJson = null;
       }
@@ -373,7 +405,7 @@ app.post('/api/ai', async (req, res) => {
         );
         aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         try {
-          aiJson = JSON.parse(aiResponse);
+          aiJson = JSON.parse(cleanAIResponse(aiResponse));
         } catch (e) {
           aiJson = null;
         }
@@ -386,7 +418,7 @@ app.post('/api/ai', async (req, res) => {
         );
         aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         try {
-          aiJson = JSON.parse(aiResponse);
+          aiJson = JSON.parse(cleanAIResponse(aiResponse));
         } catch (e) {
           aiJson = null;
         }
@@ -487,7 +519,7 @@ app.post('/api/ai', async (req, res) => {
         }
         aiResponse = '{' + text;
         try {
-          aiJson = JSON.parse(aiResponse);
+          aiJson = JSON.parse(cleanAIResponse(aiResponse));
         } catch (e) {
           aiJson = null;
         }
@@ -619,6 +651,7 @@ app.post('/api/upload', upload.array('images', 5), (req, res) => {
 app.use('/uploads', express.static(uploadDir));
 
 // --- Terminal Suggestion Endpoint (Gemini Flash) ---
+// Accepts up to 6 recent terminal entries for context
 app.post('/api/ai/terminal-suggest', async (req, res) => {
   const { entries, latestCommand, command, output } = req.body;
   function escapeForPrompt(str) {
@@ -662,7 +695,7 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
       );
       aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       try {
-        aiJson = JSON.parse(aiResponse);
+        aiJson = JSON.parse(cleanAIResponse(aiResponse));
       } catch (e) {
         aiJson = null;
       }
@@ -675,7 +708,7 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
       );
       aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       try {
-        aiJson = JSON.parse(aiResponse);
+        aiJson = JSON.parse(cleanAIResponse(aiResponse));
       } catch (e) {
         aiJson = null;
       }
@@ -693,6 +726,7 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
 });
 
 // --- Alternative Terminal Suggestion Endpoint (Gemini Flash) ---
+// Accepts up to 6 recent terminal entries for context
 app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
   const { entries, previousSuggestion } = req.body;
   function escapeForPrompt(str) {
@@ -738,7 +772,7 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
       );
       aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       try {
-        aiJson = JSON.parse(aiResponse);
+        aiJson = JSON.parse(cleanAIResponse(aiResponse));
       } catch (e) {
         aiJson = null;
       }
@@ -751,7 +785,7 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
       );
       aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       try {
-        aiJson = JSON.parse(aiResponse);
+        aiJson = JSON.parse(cleanAIResponse(aiResponse));
       } catch (e) {
         aiJson = null;
       }
@@ -798,7 +832,89 @@ app.get('/api/servers/:id/chat-sessions', (req, res) => {
   res.json(sessions);
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+// --- WebSocket Interactive Terminal ---
+const server = app.listen(process.env.PORT || 4000, () => {
+  console.log(`Backend server running on port ${process.env.PORT || 4000}`);
+});
+
+const wss = new WebSocket.Server({ server, path: '/ws/terminal' });
+wss.on('connection', (ws, req) => {
+  // Parse serverId from query string: /ws/terminal?serverId=123
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const serverId = url.searchParams.get('serverId');
+  if (!serverId) {
+    ws.close(1008, 'Missing serverId');
+    return;
+  }
+  const serverRow = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
+  if (!serverRow) {
+    ws.close(1008, 'Server not found');
+    return;
+  }
+  const conn = new SSHClient();
+  let shellStream = null;
+  let commandBuffer = '';
+  let outputBuffer = '';
+  let lastPrompt = '';
+  let isShellReady = false;
+  conn.on('ready', () => {
+    conn.shell({ term: 'xterm-color', cols: 80, rows: 24 }, (err, stream) => {
+      if (err) {
+        ws.send(`Shell error: ${err.message}`);
+        ws.close();
+        conn.end();
+        return;
+      }
+      shellStream = stream;
+      isShellReady = true;
+      stream.on('data', (data) => {
+        const text = data.toString('utf8');
+        ws.send(text);
+        outputBuffer += text;
+        // Detect command completion by prompt (simple heuristic: $ or # at line start)
+        const lines = outputBuffer.split(/\r?\n/);
+        const lastLine = lines[lines.length - 1];
+        if (/[$#] $/.test(lastLine)) {
+          // Command likely finished, log it
+          if (commandBuffer.trim()) {
+            db.prepare('INSERT INTO history (server_id, command, output) VALUES (?, ?, ?)')
+              .run(serverId, commandBuffer.trim(), outputBuffer);
+            commandBuffer = '';
+            outputBuffer = '';
+          }
+        }
+      });
+      stream.on('close', () => {
+        ws.close();
+        conn.end();
+      });
+      stream.stderr?.on('data', (data) => {
+        ws.send(data.toString('utf8'));
+        outputBuffer += data.toString('utf8');
+      });
+    });
+  }).on('error', (err) => {
+    ws.send(`SSH error: ${err.message}`);
+    ws.close();
+  }).connect({
+    host: serverRow.host,
+    port: serverRow.port,
+    username: serverRow.username,
+    password: serverRow.password || undefined,
+    privateKey: serverRow.privateKey || undefined,
+  });
+  ws.on('message', (msg) => {
+    if (!isShellReady || !shellStream) return;
+    shellStream.write(msg);
+    // Buffer command for logging (simple: accumulate until Enter) 
+    if (typeof msg === 'string' && msg.endsWith('\n')) {
+      commandBuffer += msg;
+    } else if (typeof msg === 'string') {
+      commandBuffer += msg;
+    }
+  });
+  ws.on('close', () => {
+    if (shellStream) shellStream.end();
+    conn.end();
+  });
 }); 
