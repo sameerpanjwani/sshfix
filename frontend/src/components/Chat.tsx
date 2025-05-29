@@ -339,15 +339,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
         </div>
       )}
       <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, padding: 8, background: '#fff', borderRadius: 8, boxShadow: '0 1px 4px #0001', maxHeight: panelHeight }}>
-        {[...history, ...geminiSuggestions.map((s, idx) => ({
-          role: 'ai',
-          message: s.response,
-          json: s.json,
-          model: 'gemini',
-          created_at: s.created_at || new Date().toISOString(),
-          isGeminiSuggestion: true,
-          id: `gemini-suggest-${idx}`
-        }))].filter(msg => msg.role !== 'gemini-suggest').map((msg, i) => {
+        {history.map((msg, i) => {
           const isAI = msg.role === 'ai';
           let answer = msg.message;
           let commands: string[] = [];
@@ -451,11 +443,9 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
             <option value="claude" disabled={aiAvailable ? !aiAvailable.claude : false}>Claude Sonnet 4</option>
           </select>
         </div>
-        {typeof estimatedTokens === 'number' && (
-          <span style={{ fontSize: 13, color: '#888', background: '#f8fafc', borderRadius: 6, padding: '2px 10px', zIndex: 2 }}>
-            Estimated tokens: {typeof estimatedTokens === 'number' ? estimatedTokens : 0}
-          </span>
-        )}
+        <span style={{ fontSize: 13, color: '#888', background: '#f8fafc', borderRadius: 6, padding: '2px 10px', zIndex: 2 }}>
+          Estimated tokens: {typeof estimatedTokens === 'number' ? estimatedTokens : 0}
+        </span>
       </div>
       {imagePreviews.length > 0 && (
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>

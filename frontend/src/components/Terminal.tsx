@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { runSSHCommand } from '../api/ssh';
+import axios from 'axios';
 
 interface TerminalEntry {
   command: string;
