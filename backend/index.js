@@ -198,7 +198,7 @@ app.post('/api/servers/:id/chat', (req, res) => {
 
 // Update AI Suggestion Endpoint to use and store chat history
 app.post('/api/ai', async (req, res) => {
-  const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt, imageUrls } = req.body;
+  const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt, imageUrls, messageId, edit } = req.body;
   try {
     if (newSession && serverId) {
       // Clear chat history for this server/session
@@ -207,7 +207,7 @@ app.post('/api/ai', async (req, res) => {
     let chatHistory = [];
     if (serverId) {
       // Fetch all chat history for this server
-      chatHistory = db.prepare('SELECT role, message FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(serverId);
+      chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(serverId);
     }
     let terminalHistory = [];
     if (withTerminalContext && serverId) {
@@ -224,13 +224,23 @@ app.post('/api/ai', async (req, res) => {
       messages.push({ role: 'system', content: 'Recent terminal activity:' });
       messages.push(...terminalHistory.reverse().map(h => ({ role: 'user', content: `$ ${h.command}\n${h.output}` })));
     }
-    messages.push(...chatHistory.map(m => ({ role: m.role, content: m.message })));
-    // Prepare user message with images
+    // If editing, replace the last user message in chatHistory
     let userMsg = prompt;
     if (imageUrls && Array.isArray(imageUrls) && imageUrls.length > 0) {
       userMsg += '\n[The user attached images for analysis.]';
     }
-    messages.push({ role: 'user', content: userMsg });
+    let chatHistoryForAI = chatHistory.map(m => ({ role: m.role, content: m.message }));
+    if (edit && messageId) {
+      // Find the index of the message to edit
+      const idx = chatHistory.findIndex(m => m.id === messageId && m.role === 'user');
+      if (idx !== -1) {
+        chatHistoryForAI[idx] = { role: 'user', content: userMsg };
+      }
+    }
+    messages.push(...chatHistoryForAI);
+    if (!edit) {
+      messages.push({ role: 'user', content: userMsg });
+    }
     // Estimate tokens (very rough: word count * 1.3)
     const contextText = messages.map(m => m.content).join(' ');
     const estimatedTokens = Math.round(contextText.split(/\s+/).length * 1.3);
@@ -294,7 +304,8 @@ app.post('/api/ai', async (req, res) => {
     } else if (model === 'claude') {
       // Anthropic Claude Sonnet 4 (2025, with caching and image support)
       const claudeApiKey = process.env.CLAUDE_API_KEY;
-      let claudeMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      // For Claude, do NOT include markdown image links in user message
+      let claudeMessages = messages.map(m => ({ role: m.role, content: m.content.replace(/!\[.*?\]\(.*?\)/g, '') }));
       let media = [];
       if (imageUrls && imageUrls.length > 0) {
         const images = await fetchImagesAsBase64(imageUrls);
@@ -320,10 +331,20 @@ app.post('/api/ai', async (req, res) => {
     } else {
       return res.status(400).json({ error: 'Invalid model' });
     }
-    // Store user prompt and AI response in chat_history if serverId is present
+    // Store or update user prompt and AI response in chat_history if serverId is present
     if (serverId) {
-      db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'user', prompt);
-      db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'ai', aiResponse);
+      if (edit && messageId) {
+        // Update the user message and AI response
+        db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(prompt, messageId, 'user');
+        // Find the next AI message after this user message
+        const aiMsg = db.prepare('SELECT id FROM chat_history WHERE server_id = ? AND id > ? AND role = ? ORDER BY id ASC LIMIT 1').get(serverId, messageId, 'ai');
+        if (aiMsg) {
+          db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(aiResponse, aiMsg.id, 'ai');
+        }
+      } else {
+        db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'user', prompt);
+        db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'ai', aiResponse);
+      }
     }
     res.json({ response: aiResponse, estimatedTokens });
   } catch (err) {
