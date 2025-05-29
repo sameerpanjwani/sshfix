@@ -30,6 +30,11 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400 }) => {
   const [images, setImages] = useState<File[]>([]);
   const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [editingMsgId, setEditingMsgId] = useState<number | null>(null);
+  const [editPrompt, setEditPrompt] = useState('');
+  const [editImages, setEditImages] = useState<File[]>([]);
+  const [editImagePreviews, setEditImagePreviews] = useState<string[]>([]);
+  const [editImageUrls, setEditImageUrls] = useState<string[]>([]);
 
   useEffect(() => {
     getAIAvailability().then(setAIAvailable);
@@ -166,6 +171,93 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400 }) => {
 
   const noAIConfigured = aiAvailable && !aiAvailable.openai && !aiAvailable.gemini && !aiAvailable.claude;
 
+  const startEdit = (msg: any, idx: number) => {
+    setEditingMsgId(msg.id);
+    // Remove markdown image links from prompt for editing
+    const text = msg.message.replace(/!\[image\]\([^)]*\)/g, '').trim();
+    setEditPrompt(text);
+    // Extract image URLs from markdown
+    const urls = (msg.message.match(/!\[image\]\(([^)]*)\)/g) || []).map((m: string) => m.match(/!\[image\]\(([^)]*)\)/)?.[1]).filter(Boolean) as string[];
+    setEditImageUrls(urls);
+    setEditImages([]);
+    setEditImagePreviews([]);
+  };
+
+  const cancelEdit = () => {
+    setEditingMsgId(null);
+    setEditPrompt('');
+    setEditImages([]);
+    setEditImagePreviews([]);
+    setEditImageUrls([]);
+  };
+
+  const handleEditFiles = (files: FileList | File[]) => {
+    const arr = Array.from(files).filter(f => f.type.startsWith('image/')).slice(0, 5 - editImages.length - editImageUrls.length);
+    if (arr.length === 0) return;
+    setEditImages(prev => [...prev, ...arr].slice(0, 5 - editImageUrls.length));
+  };
+
+  useEffect(() => {
+    if (editImages.length === 0) {
+      setEditImagePreviews([]);
+      return;
+    }
+    Promise.all(editImages.map(f => {
+      return new Promise<string>(resolve => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target?.result as string);
+        reader.readAsDataURL(f);
+      });
+    })).then(setEditImagePreviews);
+  }, [editImages]);
+
+  const handleRemoveEditImage = (idx: number, isUrl = false) => {
+    if (isUrl) {
+      setEditImageUrls(prev => prev.filter((_, i) => i !== idx));
+    } else {
+      setEditImages(prev => prev.filter((_, i) => i !== idx));
+    }
+  };
+
+  const handleEditSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingMsgId || !serverId) return;
+    setLoading(true);
+    let imageUrls: string[] = [...editImageUrls];
+    if (editImages.length > 0) {
+      try {
+        const uploaded = await uploadImages(editImages);
+        imageUrls = [...imageUrls, ...uploaded];
+      } catch (e) {
+        setLoading(false);
+        alert('Image upload failed.');
+        return;
+      }
+    }
+    // Compose new message with markdown for UI/history
+    let userMsg = editPrompt;
+    if (imageUrls.length > 0) {
+      userMsg += '\n' + imageUrls.map(url => `![image](${url})`).join(' ');
+    }
+    // Send edit to backend
+    try {
+      const res = await getAISuggestion(editPrompt, model, serverId, withTerminalContext, false, imageUrls, true, editingMsgId);
+      // Update history in-place
+      setHistory((hist: any[]) => hist.map((m: any, i: number) => {
+        if (m.id === editingMsgId) return { ...m, message: userMsg };
+        // Update the next AI message after this user message
+        if (i > 0 && hist[i - 1]?.id === editingMsgId && m.role === 'ai') return { ...m, message: res.response };
+        return m;
+      }));
+      setEstimatedTokens(res.estimatedTokens || null);
+      cancelEdit();
+    } catch (e: any) {
+      alert('Edit failed: ' + (e?.response?.data?.error || e.message));
+      setLoading(false);
+    }
+    setLoading(false);
+  };
+
   return (
     <div
       style={{ background: '#f5f7fa', borderRadius: 12, padding: 16, minHeight: 320, boxShadow: '0 2px 8px #0001', display: 'flex', flexDirection: 'column', height: '100%' }}
@@ -196,7 +288,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400 }) => {
       </div>
       <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, padding: 8, background: '#fff', borderRadius: 8, boxShadow: '0 1px 4px #0001', maxHeight: panelHeight }}>
         {history.map((msg, i) => (
-          <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 10 }}>
+          <div key={msg.id || i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 10 }}>
             <div style={{
               background: msg.role === 'user' ? '#6cf' : '#e0e7ff',
               color: msg.role === 'user' ? '#fff' : '#222',
@@ -207,7 +299,40 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400 }) => {
               alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
               fontWeight: 500
             }}>{msg.message}</div>
-            <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>{msg.role === 'user' ? 'You' : 'AI'} • {new Date(msg.created_at).toLocaleTimeString()}</div>
+            <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>
+              {msg.role === 'user'
+                ? 'You'
+                : `${model === 'openai' ? 'OpenAI' : model === 'gemini' ? 'Gemini' : model === 'claude' ? 'Claude' : 'AI'} AI`}
+              {' • ' + new Date(msg.created_at).toLocaleString()}
+              {msg.role === 'user' && editingMsgId !== msg.id && (
+                <button style={{ marginLeft: 8, fontSize: 10, color: '#6cf', background: 'none', border: 'none', cursor: 'pointer' }} onClick={() => startEdit(msg, i)}>Edit/Retry</button>
+              )}
+            </div>
+            {editingMsgId === msg.id && (
+              <form onSubmit={handleEditSubmit} style={{ marginTop: 8, background: '#f0f4ff', borderRadius: 8, padding: 12, boxShadow: '0 1px 4px #0001' }}>
+                <textarea value={editPrompt} onChange={e => setEditPrompt(e.target.value)} rows={2} style={{ width: '100%', borderRadius: 8, border: '1px solid #ccc', padding: 8, fontFamily: 'inherit', resize: 'none' }} placeholder="Edit your message..." title="Edit your message" />
+                <div style={{ display: 'flex', gap: 8, margin: '8px 0' }}>
+                  {editImageUrls.map((url, idx) => (
+                    <div key={url} style={{ position: 'relative' }}>
+                      <img src={url} alt="old attachment" style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 8, border: '1px solid #ccc' }} />
+                      <button type="button" onClick={() => handleRemoveEditImage(idx, true)} style={{ position: 'absolute', top: -8, right: -8, background: '#fff', border: '1px solid #e53e3e', color: '#e53e3e', borderRadius: '50%', width: 18, height: 18, fontSize: 10, cursor: 'pointer' }}>×</button>
+                    </div>
+                  ))}
+                  {editImagePreviews.map((src, idx) => (
+                    <div key={src} style={{ position: 'relative' }}>
+                      <img src={src} alt="preview" style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 8, border: '1px solid #ccc' }} />
+                      <button type="button" onClick={() => handleRemoveEditImage(idx, false)} style={{ position: 'absolute', top: -8, right: -8, background: '#fff', border: '1px solid #e53e3e', color: '#e53e3e', borderRadius: '50%', width: 18, height: 18, fontSize: 10, cursor: 'pointer' }}>×</button>
+                    </div>
+                  ))}
+                </div>
+                <input type="file" accept="image/*" multiple style={{ display: 'none' }} id="edit-attach" onChange={e => e.target.files && handleEditFiles(e.target.files)} title="Attach images for edit" />
+                <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                  <button type="button" onClick={() => document.getElementById('edit-attach')?.click()} style={{ borderRadius: 8, background: '#e0e7ff', color: '#222', fontWeight: 700, padding: '6px 12px', minWidth: 0 }}>📎</button>
+                  <button type="submit" style={{ borderRadius: 8, background: '#6cf', color: '#222', fontWeight: 700, padding: '6px 16px', minWidth: 80 }}>Save</button>
+                  <button type="button" onClick={cancelEdit} style={{ borderRadius: 8, background: '#fff', color: '#e53e3e', fontWeight: 700, border: '1px solid #e53e3e', padding: '6px 16px', minWidth: 80 }}>Cancel</button>
+                </div>
+              </form>
+            )}
           </div>
         ))}
         <div ref={chatEndRef} />

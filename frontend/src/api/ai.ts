@@ -7,9 +7,14 @@ export const getAISuggestion = async (
   model: 'openai' | 'gemini' | 'claude',
   serverId?: number,
   withTerminalContext?: boolean,
-  newSession?: boolean
+  newSession?: boolean,
+  imageUrls?: string[],
+  edit?: boolean,
+  messageId?: number
 ) => {
-  const res = await axios.post(`${API_BASE}/ai`, { prompt, model, serverId, withTerminalContext, newSession });
+  const res = await axios.post(`${API_BASE}/ai`, {
+    prompt, model, serverId, withTerminalContext, newSession, imageUrls, edit, messageId
+  });
   return res.data;
 };
 
@@ -25,4 +30,18 @@ export const uploadImages = async (files: File[]) => {
     headers: { 'Content-Type': 'multipart/form-data' },
   });
   return res.data.urls as string[];
+};
+
+// For explicit edit usage
+export const editAISuggestion = async (
+  prompt: string,
+  model: 'openai' | 'gemini' | 'claude',
+  serverId: number,
+  messageId: number,
+  imageUrls?: string[]
+) => {
+  const res = await axios.post(`${API_BASE}/ai`, {
+    prompt, model, serverId, imageUrls, edit: true, messageId
+  });
+  return res.data;
 }; 
