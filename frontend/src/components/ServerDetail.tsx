@@ -4,7 +4,7 @@ import { getServer, getHistory, testServerConnection } from '../api/servers';
 import Chat from './Chat';
 import Terminal from './Terminal';
 
-const PANEL_HEIGHT = 500; // px, shared height for chat and terminal
+const PANEL_HEIGHT = 700; // px, shared height for chat and terminal
 
 const ServerDetail: React.FC = () => {
   const { id } = useParams();
@@ -15,6 +15,9 @@ const ServerDetail: React.FC = () => {
   const [testResult, setTestResult] = useState<any>(null);
   const [testing, setTesting] = useState(false);
   const [quickCommand, setQuickCommand] = useState<string | null>(null);
+  const [model, setModel] = useState<'openai' | 'gemini' | 'claude'>('openai');
+  const [pendingTerminalCommand, setPendingTerminalCommand] = useState<string | null>(null);
+  const [geminiSuggestions, setGeminiSuggestions] = useState<any[]>([]);
 
   useEffect(() => {
     if (id) {
@@ -61,6 +64,11 @@ const ServerDetail: React.FC = () => {
     setQuickCommand(cmd);
   };
 
+  // Handler to add Gemini suggestion as a chat message
+  const handleGeminiSuggestion = (suggestion: any) => {
+    setGeminiSuggestions(prev => [...prev, suggestion]);
+  };
+
   if (loading || !server) return <div>Loading...</div>;
 
   return (
@@ -83,11 +91,29 @@ const ServerDetail: React.FC = () => {
       <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT }}>
         {/* Chat (Left) */}
         <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16, height: PANEL_HEIGHT }}>
-          <Chat onQuickCommand={handleQuickCommand} panelHeight={PANEL_HEIGHT} />
+          <Chat
+            onQuickCommand={handleQuickCommand}
+            panelHeight={PANEL_HEIGHT}
+            serverId={Number(id)}
+            model={model}
+            setModel={setModel}
+            sendToTerminal={setPendingTerminalCommand}
+            geminiSuggestions={geminiSuggestions}
+          />
         </div>
         {/* Terminal (Right) */}
         <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16, height: PANEL_HEIGHT }}>
-          <Terminal serverId={Number(id)} initialHistory={history} quickCommand={quickCommand} onQuickCommandUsed={() => setQuickCommand(null)} panelHeight={PANEL_HEIGHT} />
+          <Terminal
+            serverId={Number(id)}
+            initialHistory={history}
+            quickCommand={pendingTerminalCommand || quickCommand}
+            onQuickCommandUsed={() => {
+              setPendingTerminalCommand(null);
+              setQuickCommand(null);
+            }}
+            panelHeight={PANEL_HEIGHT}
+            onGeminiSuggestion={handleGeminiSuggestion}
+          />
         </div>
       </div>
       {/* Test Connection Modal */}

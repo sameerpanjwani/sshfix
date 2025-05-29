@@ -13,9 +13,10 @@ interface TerminalProps {
   quickCommand?: string | null;
   onQuickCommandUsed?: () => void;
   panelHeight?: number;
+  onGeminiSuggestion?: (suggestion: any) => void;
 }
 
-const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400 }) => {
+const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400, onGeminiSuggestion }) => {
   const [command, setCommand] = useState('');
   const [history, setHistory] = useState<TerminalEntry[]>(initialHistory);
   const [loading, setLoading] = useState(false);
@@ -29,6 +30,18 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
       const entry = { command: toRun, output: res.output, created_at: new Date().toISOString() };
       setHistory([...history, entry]);
       setCommand('');
+      // Call Gemini suggestion endpoint
+      if (res.output && typeof onGeminiSuggestion === 'function') {
+        try {
+          const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
+          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { command: toRun, output: res.output });
+          if (suggestRes.data && suggestRes.data.response) {
+            onGeminiSuggestion(suggestRes.data);
+          }
+        } catch (err) {
+          // Ignore Gemini errors for now
+        }
+      }
     } catch (e: any) {
       setHistory([...history, { command: toRun, output: e.message, created_at: new Date().toISOString() }]);
     }

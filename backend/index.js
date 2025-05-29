@@ -207,10 +207,12 @@ app.post('/api/ai', async (req, res) => {
     let chatHistory = [];
     if (serverId) {
       chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(serverId);
+      // Exclude Gemini suggestion messages from AI context
+      chatHistory = chatHistory.filter(m => m.role !== 'gemini-suggest');
     }
     let terminalHistory = [];
     if (withTerminalContext && serverId) {
-      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 5').all(serverId);
+      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 3').all(serverId);
     }
     // Compose messages for AI API
     const messages = [];
@@ -325,10 +327,17 @@ app.post('/api/ai', async (req, res) => {
       // Gemini 2.5 with image support and JSON mode if possible
       const geminiApiKey = process.env.GEMINI_API_KEY;
       const geminiModel = 'gemini-2.5-flash-preview-04-17';
-      let geminiMessages = messages.map(m => ({
-        role: m.role === 'system' ? 'user' : m.role,
-        parts: [{ text: m.content }]
-      }));
+      let geminiMessages = messages
+        .filter(m => m.role === 'user' || m.role === 'ai')
+        .map(m => ({
+          role: m.role === 'ai' ? 'model' : 'user',
+          parts: [{ text: m.content }]
+        }));
+      // Prepend system prompt as first user message
+      geminiMessages.unshift({
+        role: 'user',
+        parts: [{ text: (systemPrompt || defaultSystemPrompt) + '\n' + jsonInstruction }]
+      });
       for (let i = 0; i < geminiMessages.length; i++) {
         if (geminiMessages[i].role === 'user') {
           const msg = geminiMessages[i];
@@ -383,48 +392,105 @@ app.post('/api/ai', async (req, res) => {
         }
       }
     } else if (model === 'claude') {
-      // Claude: force JSON output by prefilling assistant with '{'
-      const claudeApiKey = process.env.CLAUDE_API_KEY;
-      let claudeMessages = messages.map(m => ({ role: m.role, content: m.content.replace(/!\[.*?\]\(.*?\)/g, '') }));
-      let media = [];
-      if (allPrevImageUrls.length > 0) {
-        const images = await fetchImagesAsBase64(allPrevImageUrls);
-        media = [...media, ...images.map(img => ({ type: img.contentType, data: img.base64 }))];
-      }
-      if (imageUrls && imageUrls.length > 0) {
-        const images = await fetchImagesAsBase64(imageUrls);
-        media = [...media, ...images.map(img => ({ type: img.contentType, data: img.base64 }))];
-      }
-      // Prefill assistant with '{' to force JSON output
-      claudeMessages.push({ role: 'assistant', content: '{' });
-      const payload = {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: claudeMessages,
-      };
-      if (media.length > 0) {
-        payload.media = media;
-      }
-      const response = await axios.post('https://api.anthropic.com/v1/messages', payload, {
-        headers: {
-          'x-api-key': claudeApiKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-          'X-Cache-Write': 'true',
-        },
-      });
-      // Reconstruct JSON from response
-      let text = '';
-      if (response.data.content && Array.isArray(response.data.content)) {
-        text = response.data.content.map(c => c.text).join('');
-      } else if (response.data.content && response.data.content.text) {
-        text = response.data.content.text;
-      }
-      aiResponse = '{' + text;
-      try {
-        aiJson = JSON.parse(aiResponse);
-      } catch (e) {
+      // If prompt is empty (e.g., new session), do not call Claude API
+      if (!prompt || prompt.trim() === '') {
+        aiResponse = '';
         aiJson = null;
+      } else {
+        // Claude: force JSON output by prefilling assistant with '{'
+        const claudeApiKey = process.env.CLAUDE_API_KEY;
+        // Remove system messages, only use 'user' and 'ai' (as 'assistant')
+        let claudeMessages = messages
+          .filter(m => m.role === 'user' || m.role === 'ai')
+          .map(m => {
+            if (m.role === 'ai') {
+              return { role: 'assistant', content: m.content.replace(/!\[.*?\]\(.*?\)/g, '') };
+            } else {
+              // For user messages, check for images
+              const urls = extractImageUrlsFromMarkdown(m.content);
+              if (urls.length > 0) {
+                // Remove image markdown from text
+                const text = m.content.replace(/!\[.*?\]\(.*?\)/g, '').trim();
+                return { role: 'user', content: [{ type: 'text', text }, ...urls.map(url => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: '' } }))] };
+              } else {
+                return { role: 'user', content: m.content };
+              }
+            }
+          });
+        // Now, actually fetch and fill in the image data for user messages
+        let userMsgIdx = 0;
+        for (let i = 0; i < claudeMessages.length; i++) {
+          const msg = claudeMessages[i];
+          if (msg.role === 'user' && Array.isArray(msg.content)) {
+            // Find the corresponding original user message
+            const origUserMessages = messages.filter(m => m.role === 'user');
+            const origMsg = origUserMessages[userMsgIdx];
+            userMsgIdx++;
+            if (!origMsg) continue;
+            let imageIdx = 0;
+            for (let j = 0; j < msg.content.length; j++) {
+              if (msg.content[j].type === 'image') {
+                const urls = extractImageUrlsFromMarkdown(origMsg.content);
+                if (urls[imageIdx]) {
+                  try {
+                    const images = await fetchImagesAsBase64([urls[imageIdx]]);
+                    if (images[0]) {
+                      msg.content[j].source.media_type = images[0].contentType;
+                      msg.content[j].source.data = images[0].base64;
+                    }
+                  } catch (e) {
+                    msg.content.splice(j, 1);
+                    j--;
+                  }
+                }
+                imageIdx++;
+              }
+            }
+          }
+        }
+        // If the current prompt has imageUrls, add them to the last user message
+        if (imageUrls && imageUrls.length > 0) {
+          const images = await fetchImagesAsBase64(imageUrls);
+          const lastUserIdx = claudeMessages.map(m => m.role).lastIndexOf('user');
+          if (lastUserIdx !== -1) {
+            if (!Array.isArray(claudeMessages[lastUserIdx].content)) {
+              // Convert to array if not already
+              claudeMessages[lastUserIdx].content = [{ type: 'text', text: claudeMessages[lastUserIdx].content }];
+            }
+            for (let k = 0; k < images.length; k++) {
+              claudeMessages[lastUserIdx].content.push({ type: 'image', source: { type: 'base64', media_type: images[k].contentType, data: images[k].base64 } });
+            }
+          }
+        }
+        // Prefill assistant with '{' to force JSON output
+        claudeMessages.push({ role: 'assistant', content: '{' });
+        const payload = {
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1024,
+          messages: claudeMessages,
+          system: (systemPrompt || defaultSystemPrompt) + '\n' + jsonInstruction,
+        };
+        const response = await axios.post('https://api.anthropic.com/v1/messages', payload, {
+          headers: {
+            'x-api-key': claudeApiKey,
+            'anthropic-version': '2023-06-01',
+            'Content-Type': 'application/json',
+            'X-Cache-Write': 'true',
+          },
+        });
+        // Reconstruct JSON from response
+        let text = '';
+        if (response.data.content && Array.isArray(response.data.content)) {
+          text = response.data.content.map(c => c.text).join('');
+        } else if (response.data.content && response.data.content.text) {
+          text = response.data.content.text;
+        }
+        aiResponse = '{' + text;
+        try {
+          aiJson = JSON.parse(aiResponse);
+        } catch (e) {
+          aiJson = null;
+        }
       }
     } else {
       return res.status(400).json({ error: 'Invalid model' });
@@ -551,6 +617,48 @@ app.post('/api/upload', upload.array('images', 5), (req, res) => {
 
 // Serve uploaded images statically
 app.use('/uploads', express.static(uploadDir));
+
+// --- Terminal Suggestion Endpoint (Gemini Flash) ---
+app.post('/api/ai/terminal-suggest', async (req, res) => {
+  const { command, output } = req.body;
+  try {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const geminiModel = 'gemini-2.5-flash-preview-04-17';
+    const prompt = `The user just ran this command in the terminal:\n\n$ ${command}\n\nOutput:\n${output}\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}`;
+    const geminiMessages = [
+      {
+        role: 'user',
+        parts: [{ text: prompt }]
+      }
+    ];
+    const geminiPayload = {
+      contents: geminiMessages,
+      generationConfig: {
+        responseMimeType: 'application/json',
+      },
+    };
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
+      geminiPayload
+    );
+    let aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let aiJson = null;
+    try {
+      aiJson = JSON.parse(aiResponse);
+    } catch (e) {
+      aiJson = null;
+    }
+    res.json({
+      response: aiResponse,
+      json: aiJson,
+      model: 'gemini',
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('Terminal Suggestion error:', err);
+    res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
+  }
+});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

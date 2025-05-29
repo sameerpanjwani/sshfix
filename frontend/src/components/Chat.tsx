@@ -14,16 +14,18 @@ interface ChatProps {
   onQuickCommand?: (command: string) => void;
   panelHeight?: number;
   serverId: number;
-  model: string;
+  model: 'openai' | 'gemini' | 'claude';
+  setModel: (m: 'openai' | 'gemini' | 'claude') => void;
   sendToTerminal?: (cmd: string) => void;
+  geminiSuggestions?: any[];
 }
 
-const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, sendToTerminal }) => {
+const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, setModel, sendToTerminal, geminiSuggestions = [] }) => {
   const [prompt, setPrompt] = useState('');
   const [history, setHistory] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [aiAvailable, setAIAvailable] = useState<{openai: boolean, gemini: boolean, claude: boolean} | null>(null);
-  const [withTerminalContext, setWithTerminalContext] = useState(false);
+  const withTerminalContext = true;
   const [estimatedTokens, setEstimatedTokens] = useState<number | null>(null);
   const [newSession, setNewSession] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -157,19 +159,8 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     setLoading(true);
     setNewSession(true);
     setHistory([]);
+    setPrompt('');
     setEstimatedTokens(null);
-    await getChatHistory(serverId).then(setHistory); // Should be empty after backend clears
-    setLoading(false);
-  };
-
-  const handleClearChat = async () => {
-    if (!serverId) return;
-    setLoading(true);
-    setHistory([]);
-    setEstimatedTokens(null);
-    // Clear chat history in backend (reuse newSession logic)
-    await getAISuggestion('', model as 'openai' | 'gemini' | 'claude', serverId, false, true); // send empty prompt with newSession
-    await getChatHistory(serverId).then(setHistory);
     setLoading(false);
   };
 
@@ -300,14 +291,11 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
         </div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <input type="checkbox" id="with-terminal-context" checked={withTerminalContext} onChange={e => setWithTerminalContext(e.target.checked)} />
-          <label htmlFor="with-terminal-context" style={{ fontWeight: 500 }}>Include terminal context</label>
-        </div>
         <button onClick={handleNewSession} style={{ borderRadius: 8, background: '#fff', color: '#6cf', fontWeight: 700, border: '1px solid #6cf', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>New Chat Session</button>
-        <button onClick={handleClearChat} style={{ borderRadius: 8, background: '#fff', color: '#e53e3e', fontWeight: 700, border: '1px solid #e53e3e', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>Clear Chat</button>
         {estimatedTokens !== null && (
-          <span style={{ color: '#888', fontSize: 13 }}>Estimated tokens: {estimatedTokens}</span>
+          <div style={{ position: 'absolute', top: 16, right: 24, color: '#888', fontSize: 13, fontWeight: 500, zIndex: 2 }}>
+            <span>Estimated tokens: {typeof estimatedTokens === 'number' ? estimatedTokens : 0}</span>
+          </div>
         )}
       </div>
       <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -315,8 +303,51 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           <button key={i} style={{ borderRadius: 6, background: '#e0e7ff', color: '#222', fontWeight: 500, border: 'none', padding: '6px 12px', cursor: 'pointer' }} onClick={() => handleQuickAction(action.value)}>{action.label}</button>
         ))}
       </div>
+      {/* Gemini Suggestions Tab Section */}
+      {geminiSuggestions.length > 0 && (
+        <div style={{ marginBottom: 16, background: '#f0f4ff', borderRadius: 10, boxShadow: '0 1px 4px #0001', padding: 12, border: '1px solid #b6d0ff' }}>
+          <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 8 }}>
+            <div style={{ fontWeight: 700, color: '#2563eb', fontSize: 16 }}>Gemini Suggestions</div>
+            {/* Future: add more tabs here */}
+          </div>
+          <div style={{ maxHeight: 180, overflowY: 'auto' }}>
+            {geminiSuggestions.slice(-3).reverse().map((s, idx) => {
+              const answer = s.json?.answer || s.response || '';
+              const commands: string[] = s.json?.commands || [];
+              return (
+                <div key={idx} style={{ marginBottom: 12, background: '#fff', borderRadius: 8, padding: 10, boxShadow: '0 1px 2px #0001', border: '1px solid #e0e7ff' }}>
+                  <div style={{ color: '#222', marginBottom: 4 }}>{answer}</div>
+                  {commands.length > 0 && (
+                    <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {commands.map((cmd: string, cidx: number) => (
+                        <button
+                          key={cidx}
+                          style={{ fontFamily: 'monospace', fontSize: 13, padding: '4px 10px', borderRadius: 6, border: '1px solid #888', background: '#f5f7fa', cursor: 'pointer' }}
+                          onClick={() => handleCommandClick(cmd)}
+                          title="Send to terminal"
+                        >
+                          {cmd}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Gemini Flash • {s.created_at ? new Date(s.created_at).toLocaleString() : ''}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, padding: 8, background: '#fff', borderRadius: 8, boxShadow: '0 1px 4px #0001', maxHeight: panelHeight }}>
-        {history.map((msg, i) => {
+        {[...history, ...geminiSuggestions.map((s, idx) => ({
+          role: 'ai',
+          message: s.response,
+          json: s.json,
+          model: 'gemini',
+          created_at: s.created_at || new Date().toISOString(),
+          isGeminiSuggestion: true,
+          id: `gemini-suggest-${idx}`
+        }))].filter(msg => msg.role !== 'gemini-suggest').map((msg, i) => {
           const isAI = msg.role === 'ai';
           let answer = msg.message;
           let commands: string[] = [];
@@ -327,7 +358,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
             ({ answer, commands } = parseAIResponse(msg.message, undefined));
           }
           return (
-            <div key={msg.id || i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 10 }}>
+            <div key={msg.id || i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 10, opacity: msg.isGeminiSuggestion ? 0.95 : 1 }}>
               <div style={{
                 background: msg.role === 'user' ? '#6cf' : '#e0e7ff',
                 color: msg.role === 'user' ? '#fff' : '#222',
@@ -341,6 +372,9 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                 {/* Render answer for AI, or message for user */}
                 {isAI ? (
                   <>
+                    {msg.isGeminiSuggestion && (
+                      <div style={{ fontSize: 12, color: '#3b82f6', fontWeight: 700, marginBottom: 2 }}>Gemini Suggestion</div>
+                    )}
                     <div>{answer}</div>
                     {commands && commands.length > 0 && (
                       <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -367,7 +401,9 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
               <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>
                 {msg.role === 'user'
                   ? 'You'
-                  : `${model === 'openai' ? 'OpenAI' : model === 'gemini' ? 'Gemini' : model === 'claude' ? 'Claude' : 'AI'} AI`}
+                  : msg.model === 'gemini' || msg.isGeminiSuggestion
+                    ? 'Gemini AI'
+                    : `${model === 'openai' ? 'OpenAI' : model === 'gemini' ? 'Gemini' : model === 'claude' ? 'Claude' : 'AI'} AI`}
                 {' • ' + new Date(msg.created_at).toLocaleString()}
               </div>
               {editingMsgId === msg.id && (
@@ -400,13 +436,26 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
         })}
         <div ref={chatEndRef} />
       </div>
-      <div style={{ marginBottom: 8 }}>
-        <label htmlFor="model-select">AI Model: </label>
-        <select value={model} disabled style={{ marginRight: 8 }} title="AI Model">
-          <option value="openai" disabled={aiAvailable ? !aiAvailable.openai : false}>OpenAI GPT-4o</option>
-          <option value="gemini" disabled={aiAvailable ? !aiAvailable.gemini : false}>Gemini Flash 2.5</option>
-          <option value="claude" disabled={aiAvailable ? !aiAvailable.claude : false}>Claude 3 Sonnet (4.0)</option>
-        </select>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <div>
+          <label htmlFor="model-select">AI Model: </label>
+          <select
+            id="model-select"
+            value={model}
+            onChange={e => setModel(e.target.value as 'openai' | 'gemini' | 'claude')}
+            style={{ marginRight: 8 }}
+            title="AI Model"
+          >
+            <option value="openai" disabled={aiAvailable ? !aiAvailable.openai : false}>OpenAI GPT-4o</option>
+            <option value="gemini" disabled={aiAvailable ? !aiAvailable.gemini : false}>Gemini Flash 2.5</option>
+            <option value="claude" disabled={aiAvailable ? !aiAvailable.claude : false}>Claude Sonnet 4</option>
+          </select>
+        </div>
+        {typeof estimatedTokens === 'number' && (
+          <span style={{ fontSize: 13, color: '#888', background: '#f8fafc', borderRadius: 6, padding: '2px 10px', zIndex: 2 }}>
+            Estimated tokens: {typeof estimatedTokens === 'number' ? estimatedTokens : 0}
+          </span>
+        )}
       </div>
       {imagePreviews.length > 0 && (
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
