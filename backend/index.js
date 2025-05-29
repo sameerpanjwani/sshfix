@@ -199,19 +199,17 @@ app.post('/api/servers/:id/chat', (req, res) => {
 // Update AI Suggestion Endpoint to use and store chat history
 app.post('/api/ai', async (req, res) => {
   const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt, imageUrls, messageId, edit } = req.body;
+  console.log('[AI ENDPOINT] Received imageUrls:', imageUrls);
   try {
     if (newSession && serverId) {
-      // Clear chat history for this server/session
       db.prepare('DELETE FROM chat_history WHERE server_id = ?').run(serverId);
     }
     let chatHistory = [];
     if (serverId) {
-      // Fetch all chat history for this server
       chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(serverId);
     }
     let terminalHistory = [];
     if (withTerminalContext && serverId) {
-      // Fetch last 5 terminal commands/outputs
       terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 5').all(serverId);
     }
     // Compose messages for AI API
@@ -219,7 +217,9 @@ app.post('/api/ai', async (req, res) => {
     // Add system prompt
     const defaultSystemPrompt =
       'You are an expert server assistant operating in a terminal environment. You can suggest shell commands for the user to run, and you will see the output of those commands. Your job is to help the user diagnose, fix, and automate server issues using the terminal. Always be safe, never suggest anything that could cause harm, data loss, or security issues. Explain your reasoning, ask for confirmation before any risky action, and help the user get things done efficiently.';
-    messages.push({ role: 'system', content: systemPrompt || defaultSystemPrompt });
+    // --- Add JSON output instruction ---
+    const jsonInstruction = 'Always respond in JSON with two fields: "answer" (string, your explanation and advice) and "commands" (array of shell commands the user could run, if any). Example: {"answer": "...", "commands": ["ls -la", "cat /etc/passwd"]}. Do not include any markdown or extra text.';
+    messages.push({ role: 'system', content: (systemPrompt || defaultSystemPrompt) + '\n' + jsonInstruction });
     if (withTerminalContext && terminalHistory.length > 0) {
       messages.push({ role: 'system', content: 'Recent terminal activity:' });
       messages.push(...terminalHistory.reverse().map(h => ({ role: 'user', content: `$ ${h.command}\n${h.output}` })));
@@ -229,9 +229,25 @@ app.post('/api/ai', async (req, res) => {
     if (imageUrls && Array.isArray(imageUrls) && imageUrls.length > 0) {
       userMsg += '\n[The user attached images for analysis.]';
     }
+    // Collect all image URLs from previous user messages
+    function extractImageUrlsFromMarkdown(text) {
+      const regex = /!\[image\]\(([^)]+)\)/g;
+      const urls = [];
+      let match;
+      while ((match = regex.exec(text))) {
+        urls.push(match[1]);
+      }
+      return urls;
+    }
+    let allPrevImageUrls = [];
+    chatHistory.forEach(m => {
+      if (m.role === 'user') {
+        allPrevImageUrls.push(...extractImageUrlsFromMarkdown(m.message));
+      }
+    });
+    allPrevImageUrls = [...new Set(allPrevImageUrls)];
     let chatHistoryForAI = chatHistory.map(m => ({ role: m.role, content: m.message }));
     if (edit && messageId) {
-      // Find the index of the message to edit
       const idx = chatHistory.findIndex(m => m.id === messageId && m.role === 'user');
       if (idx !== -1) {
         chatHistoryForAI[idx] = { role: 'user', content: userMsg };
@@ -242,28 +258,47 @@ app.post('/api/ai', async (req, res) => {
       messages.push({ role: 'user', content: userMsg });
     }
     // Estimate tokens (very rough: word count * 1.3)
-    const contextText = messages.map(m => m.content).join(' ');
+    const contextText = messages.map(m => m.content).join('\n');
     const estimatedTokens = Math.round(contextText.split(/\s+/).length * 1.3);
     let aiResponse = '';
+    let aiJson = null;
     // Helper to fetch and encode images
     async function fetchImagesAsBase64(urls) {
       const results = [];
       for (const url of urls) {
-        const absUrl = url.startsWith('/uploads/') ? `${req.protocol}://${req.get('host')}${url}` : url;
-        const resp = await axios.get(absUrl, { responseType: 'arraybuffer' });
-        const contentType = resp.headers['content-type'] || 'image/png';
-        const base64 = Buffer.from(resp.data, 'binary').toString('base64');
-        results.push({ base64, contentType });
+        try {
+          const absUrl = url.startsWith('/uploads/') ? `${req.protocol}://${req.get('host')}${url}` : url;
+          console.log('[fetchImagesAsBase64] Fetching:', absUrl);
+          const resp = await axios.get(absUrl, { responseType: 'arraybuffer' });
+          const contentType = resp.headers['content-type'] || 'image/png';
+          const base64 = Buffer.from(resp.data, 'binary').toString('base64');
+          results.push({ base64, contentType });
+        } catch (err) {
+          console.error('[fetchImagesAsBase64] Error fetching image:', url, err.message);
+        }
       }
       return results;
     }
     if (model === 'openai') {
-      // OpenAI GPT-4o with image support
+      // OpenAI GPT-4o with image support and JSON mode
       const openaiApiKey = process.env.OPENAI_API_KEY;
-      let openaiMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      let openaiMessages = messages.map(m => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.content }));
+      for (let i = 0; i < openaiMessages.length; i++) {
+        if (openaiMessages[i].role === 'user') {
+          const msg = openaiMessages[i];
+          const urls = extractImageUrlsFromMarkdown(msg.content);
+          if (urls.length > 0) {
+            const images = await fetchImagesAsBase64(urls);
+            const contentArr = [{ type: 'text', text: msg.content.replace(/!\[image\]\(([^)]+)\)/g, '').trim() }];
+            for (const img of images) {
+              contentArr.push({ type: 'image_url', image_url: { url: `data:${img.contentType};base64,${img.base64}` } });
+            }
+            openaiMessages[i] = { role: 'user', content: contentArr };
+          }
+        }
+      }
       if (imageUrls && imageUrls.length > 0) {
         const images = await fetchImagesAsBase64(imageUrls);
-        // Compose content array for the last user message
         const contentArr = [{ type: 'text', text: userMsg }];
         for (const img of images) {
           contentArr.push({ type: 'image_url', image_url: { url: `data:${img.contentType};base64,${img.base64}` } });
@@ -273,6 +308,7 @@ app.post('/api/ai', async (req, res) => {
       const response = await axios.post('https://api.openai.com/v1/chat/completions', {
         model: 'gpt-4o',
         messages: openaiMessages,
+        response_format: { type: 'json_object' },
       }, {
         headers: {
           'Authorization': `Bearer ${openaiApiKey}`,
@@ -280,37 +316,87 @@ app.post('/api/ai', async (req, res) => {
         },
       });
       aiResponse = response.data.choices[0].message.content;
+      try {
+        aiJson = JSON.parse(aiResponse);
+      } catch (e) {
+        aiJson = null;
+      }
     } else if (model === 'gemini') {
-      // Google Gemini 2.5 Flash Preview (with caching and image support)
+      // Gemini 2.5 with image support and JSON mode if possible
       const geminiApiKey = process.env.GEMINI_API_KEY;
       const geminiModel = 'gemini-2.5-flash-preview-04-17';
       let geminiMessages = messages.map(m => ({
-        role: m.role === 'system' ? 'user' : m.role, // Gemini does not support 'system', treat as 'user'
+        role: m.role === 'system' ? 'user' : m.role,
         parts: [{ text: m.content }]
       }));
+      for (let i = 0; i < geminiMessages.length; i++) {
+        if (geminiMessages[i].role === 'user') {
+          const msg = geminiMessages[i];
+          const urls = extractImageUrlsFromMarkdown(msg.parts[0].text);
+          if (urls.length > 0) {
+            const images = await fetchImagesAsBase64(urls);
+            geminiMessages[i].parts = [
+              { text: msg.parts[0].text.replace(/!\[image\]\(([^)]+)\)/g, '').trim() },
+              ...images.map(img => ({ inline_data: { mime_type: img.contentType, data: img.base64 } }))
+            ];
+          }
+        }
+      }
       if (imageUrls && imageUrls.length > 0) {
         const images = await fetchImagesAsBase64(imageUrls);
-        // Attach images to the last user message
         geminiMessages[geminiMessages.length - 1].parts = [
           { text: userMsg },
           ...images.map(img => ({ inline_data: { mime_type: img.contentType, data: img.base64 } }))
         ];
       }
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        { contents: geminiMessages, cache: { enable: true } }
-      );
-      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      // Try to use responseMimeType for JSON output
+      let geminiPayload = {
+        contents: geminiMessages,
+        generationConfig: {
+          responseMimeType: 'application/json',
+        },
+      };
+      let response;
+      try {
+        response = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
+          geminiPayload
+        );
+        aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        try {
+          aiJson = JSON.parse(aiResponse);
+        } catch (e) {
+          aiJson = null;
+        }
+      } catch (err) {
+        // If the API errors, fallback to prompt-based JSON
+        geminiPayload = { contents: geminiMessages };
+        response = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
+          geminiPayload
+        );
+        aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        try {
+          aiJson = JSON.parse(aiResponse);
+        } catch (e) {
+          aiJson = null;
+        }
+      }
     } else if (model === 'claude') {
-      // Anthropic Claude Sonnet 4 (2025, with caching and image support)
+      // Claude: force JSON output by prefilling assistant with '{'
       const claudeApiKey = process.env.CLAUDE_API_KEY;
-      // For Claude, do NOT include markdown image links in user message
       let claudeMessages = messages.map(m => ({ role: m.role, content: m.content.replace(/!\[.*?\]\(.*?\)/g, '') }));
       let media = [];
+      if (allPrevImageUrls.length > 0) {
+        const images = await fetchImagesAsBase64(allPrevImageUrls);
+        media = [...media, ...images.map(img => ({ type: img.contentType, data: img.base64 }))];
+      }
       if (imageUrls && imageUrls.length > 0) {
         const images = await fetchImagesAsBase64(imageUrls);
-        media = images.map(img => ({ type: img.contentType, data: img.base64 }));
+        media = [...media, ...images.map(img => ({ type: img.contentType, data: img.base64 }))];
       }
+      // Prefill assistant with '{' to force JSON output
+      claudeMessages.push({ role: 'assistant', content: '{' });
       const payload = {
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1024,
@@ -324,19 +410,29 @@ app.post('/api/ai', async (req, res) => {
           'x-api-key': claudeApiKey,
           'anthropic-version': '2023-06-01',
           'Content-Type': 'application/json',
-          'X-Cache-Write': 'true', // Enable Claude cache
+          'X-Cache-Write': 'true',
         },
       });
-      aiResponse = response.data.content[0].text;
+      // Reconstruct JSON from response
+      let text = '';
+      if (response.data.content && Array.isArray(response.data.content)) {
+        text = response.data.content.map(c => c.text).join('');
+      } else if (response.data.content && response.data.content.text) {
+        text = response.data.content.text;
+      }
+      aiResponse = '{' + text;
+      try {
+        aiJson = JSON.parse(aiResponse);
+      } catch (e) {
+        aiJson = null;
+      }
     } else {
       return res.status(400).json({ error: 'Invalid model' });
     }
     // Store or update user prompt and AI response in chat_history if serverId is present
     if (serverId) {
       if (edit && messageId) {
-        // Update the user message and AI response
         db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(prompt, messageId, 'user');
-        // Find the next AI message after this user message
         const aiMsg = db.prepare('SELECT id FROM chat_history WHERE server_id = ? AND id > ? AND role = ? ORDER BY id ASC LIMIT 1').get(serverId, messageId, 'ai');
         if (aiMsg) {
           db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(aiResponse, aiMsg.id, 'ai');
@@ -346,7 +442,7 @@ app.post('/api/ai', async (req, res) => {
         db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'ai', aiResponse);
       }
     }
-    res.json({ response: aiResponse, estimatedTokens });
+    res.json({ response: aiResponse, json: aiJson, estimatedTokens });
   } catch (err) {
     console.error('AI endpoint error:', err);
     res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
