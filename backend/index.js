@@ -5,6 +5,8 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const { Client: SSHClient } = require('ssh2');
 const axios = require('axios');
+const multer = require('multer');
+const fs = require('fs');
 
 // Load environment variables
 dotenv.config();
@@ -58,6 +60,25 @@ CREATE TABLE IF NOT EXISTS chat_history (
   FOREIGN KEY(server_id) REFERENCES servers(id)
 );
 `);
+
+// Multer setup for image uploads
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const base = path.basename(file.originalname, ext);
+    cb(null, base + '-' + Date.now() + ext);
+  }
+});
+const imageFilter = (req, file, cb) => {
+  if (!file.mimetype.match(/^image\/(png|jpeg|jpg|gif|webp)$/)) {
+    return cb(new Error('Only image files are allowed!'), false);
+  }
+  cb(null, true);
+};
+const upload = multer({ storage, fileFilter: imageFilter, limits: { files: 5, fileSize: 5 * 1024 * 1024 } });
 
 // API: List servers
 app.get('/api/servers', (req, res) => {
@@ -177,7 +198,7 @@ app.post('/api/servers/:id/chat', (req, res) => {
 
 // Update AI Suggestion Endpoint to use and store chat history
 app.post('/api/ai', async (req, res) => {
-  const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt } = req.body;
+  const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt, imageUrls } = req.body;
   try {
     if (newSession && serverId) {
       // Clear chat history for this server/session
@@ -197,24 +218,51 @@ app.post('/api/ai', async (req, res) => {
     const messages = [];
     // Add system prompt
     const defaultSystemPrompt =
-      'You are an expert server assistant. Your job is to help the user diagnose, fix, and automate server issues using the terminal. Always be safe, never suggest anything that could cause harm, data loss, or security issues. Explain your reasoning, ask for confirmation before any risky action, and help the user get things done efficiently.';
+      'You are an expert server assistant operating in a terminal environment. You can suggest shell commands for the user to run, and you will see the output of those commands. Your job is to help the user diagnose, fix, and automate server issues using the terminal. Always be safe, never suggest anything that could cause harm, data loss, or security issues. Explain your reasoning, ask for confirmation before any risky action, and help the user get things done efficiently.';
     messages.push({ role: 'system', content: systemPrompt || defaultSystemPrompt });
     if (withTerminalContext && terminalHistory.length > 0) {
       messages.push({ role: 'system', content: 'Recent terminal activity:' });
       messages.push(...terminalHistory.reverse().map(h => ({ role: 'user', content: `$ ${h.command}\n${h.output}` })));
     }
     messages.push(...chatHistory.map(m => ({ role: m.role, content: m.message })));
-    messages.push({ role: 'user', content: prompt });
+    // Prepare user message with images
+    let userMsg = prompt;
+    if (imageUrls && Array.isArray(imageUrls) && imageUrls.length > 0) {
+      userMsg += '\n[The user attached images for analysis.]';
+    }
+    messages.push({ role: 'user', content: userMsg });
     // Estimate tokens (very rough: word count * 1.3)
     const contextText = messages.map(m => m.content).join(' ');
     const estimatedTokens = Math.round(contextText.split(/\s+/).length * 1.3);
     let aiResponse = '';
+    // Helper to fetch and encode images
+    async function fetchImagesAsBase64(urls) {
+      const results = [];
+      for (const url of urls) {
+        const absUrl = url.startsWith('/uploads/') ? `${req.protocol}://${req.get('host')}${url}` : url;
+        const resp = await axios.get(absUrl, { responseType: 'arraybuffer' });
+        const contentType = resp.headers['content-type'] || 'image/png';
+        const base64 = Buffer.from(resp.data, 'binary').toString('base64');
+        results.push({ base64, contentType });
+      }
+      return results;
+    }
     if (model === 'openai') {
-      // OpenAI GPT-4o
+      // OpenAI GPT-4o with image support
       const openaiApiKey = process.env.OPENAI_API_KEY;
+      let openaiMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      if (imageUrls && imageUrls.length > 0) {
+        const images = await fetchImagesAsBase64(imageUrls);
+        // Compose content array for the last user message
+        const contentArr = [{ type: 'text', text: userMsg }];
+        for (const img of images) {
+          contentArr.push({ type: 'image_url', image_url: { url: `data:${img.contentType};base64,${img.base64}` } });
+        }
+        openaiMessages[openaiMessages.length - 1] = { role: 'user', content: contentArr };
+      }
       const response = await axios.post('https://api.openai.com/v1/chat/completions', {
         model: 'gpt-4o',
-        messages,
+        messages: openaiMessages,
       }, {
         headers: {
           'Authorization': `Bearer ${openaiApiKey}`,
@@ -223,25 +271,49 @@ app.post('/api/ai', async (req, res) => {
       });
       aiResponse = response.data.choices[0].message.content;
     } else if (model === 'gemini') {
-      // Google Gemini 1.5 Flash
+      // Google Gemini 2.5 Flash Preview (with caching and image support)
       const geminiApiKey = process.env.GEMINI_API_KEY;
+      const geminiModel = 'gemini-2.5-flash-preview-04-17';
+      let geminiMessages = messages.map(m => ({
+        role: m.role === 'system' ? 'user' : m.role, // Gemini does not support 'system', treat as 'user'
+        parts: [{ text: m.content }]
+      }));
+      if (imageUrls && imageUrls.length > 0) {
+        const images = await fetchImagesAsBase64(imageUrls);
+        // Attach images to the last user message
+        geminiMessages[geminiMessages.length - 1].parts = [
+          { text: userMsg },
+          ...images.map(img => ({ inline_data: { mime_type: img.contentType, data: img.base64 } }))
+        ];
+      }
       const response = await axios.post(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=' + geminiApiKey,
-        { contents: [{ parts: messages.map(m => ({ text: `${m.role}: ${m.content}` })) }] }
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
+        { contents: geminiMessages, cache: { enable: true } }
       );
-      aiResponse = response.data.candidates[0].content.parts[0].text;
+      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     } else if (model === 'claude') {
-      // Anthropic Claude 3 Sonnet
+      // Anthropic Claude Sonnet 4 (2025, with caching and image support)
       const claudeApiKey = process.env.CLAUDE_API_KEY;
-      const response = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-3-sonnet-20240229',
+      let claudeMessages = messages.map(m => ({ role: m.role, content: m.content }));
+      let media = [];
+      if (imageUrls && imageUrls.length > 0) {
+        const images = await fetchImagesAsBase64(imageUrls);
+        media = images.map(img => ({ type: img.contentType, data: img.base64 }));
+      }
+      const payload = {
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 1024,
-        messages,
-      }, {
+        messages: claudeMessages,
+      };
+      if (media.length > 0) {
+        payload.media = media;
+      }
+      const response = await axios.post('https://api.anthropic.com/v1/messages', payload, {
         headers: {
           'x-api-key': claudeApiKey,
           'anthropic-version': '2023-06-01',
           'Content-Type': 'application/json',
+          'X-Cache-Write': 'true', // Enable Claude cache
         },
       });
       aiResponse = response.data.content[0].text;
@@ -349,6 +421,19 @@ app.get('/api/ai/available', (req, res) => {
     claude: !!process.env.CLAUDE_API_KEY,
   });
 });
+
+// Image upload endpoint
+app.post('/api/upload', upload.array('images', 5), (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ error: 'No images uploaded' });
+  }
+  // Return URLs for uploaded images
+  const urls = req.files.map(f => `/uploads/${f.filename}`);
+  res.json({ urls });
+});
+
+// Serve uploaded images statically
+app.use('/uploads', express.static(uploadDir));
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

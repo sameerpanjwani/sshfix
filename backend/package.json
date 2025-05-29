@@ -10,12 +10,13 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "axios": "^1.6.0",
     "better-sqlite3": "^11.10.0",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "multer": "^1.4.5-lts.1",
     "openai": "^4.103.0",
-    "ssh2": "^1.16.0",
-    "axios": "^1.6.0"
+    "ssh2": "^1.16.0"
   }
 }

@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { getServer, getHistory, testServerConnection } from '../api/servers';
 import Chat from './Chat';
 import Terminal from './Terminal';
+
+const PANEL_HEIGHT = 500; // px, shared height for chat and terminal
 
 const ServerDetail: React.FC = () => {
   const { id } = useParams();
@@ -78,14 +80,14 @@ const ServerDetail: React.FC = () => {
         <div><b>Port:</b> {server.port}</div>
       </div>
       {/* Main Area */}
-      <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: 500 }}>
+      <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT }}>
         {/* Chat (Left) */}
-        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16 }}>
-          <Chat onQuickCommand={handleQuickCommand} />
+        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16, height: PANEL_HEIGHT }}>
+          <Chat onQuickCommand={handleQuickCommand} panelHeight={PANEL_HEIGHT} />
         </div>
         {/* Terminal (Right) */}
-        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16 }}>
-          <Terminal serverId={Number(id)} initialHistory={history} quickCommand={quickCommand} onQuickCommandUsed={() => setQuickCommand(null)} />
+        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16, height: PANEL_HEIGHT }}>
+          <Terminal serverId={Number(id)} initialHistory={history} quickCommand={quickCommand} onQuickCommandUsed={() => setQuickCommand(null)} panelHeight={PANEL_HEIGHT} />
         </div>
       </div>
       {/* Test Connection Modal */}

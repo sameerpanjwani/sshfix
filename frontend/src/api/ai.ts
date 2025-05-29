@@ -16,4 +16,13 @@ export const getAISuggestion = async (
 export const getAIAvailability = async () => {
   const res = await axios.get(`${API_BASE}/ai/available`);
   return res.data;
+};
+
+export const uploadImages = async (files: File[]) => {
+  const formData = new FormData();
+  files.forEach(f => formData.append('images', f));
+  const res = await axios.post(`${API_BASE}/upload`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return res.data.urls as string[];
 }; 

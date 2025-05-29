@@ -12,9 +12,10 @@ interface TerminalProps {
   initialHistory?: TerminalEntry[];
   quickCommand?: string | null;
   onQuickCommandUsed?: () => void;
+  panelHeight?: number;
 }
 
-const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed }) => {
+const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400 }) => {
   const [command, setCommand] = useState('');
   const [history, setHistory] = useState<TerminalEntry[]>(initialHistory);
   const [loading, setLoading] = useState(false);
@@ -43,9 +44,16 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quickCommand]);
 
+  const handleClearTerminal = () => {
+    setHistory([]);
+  };
+
   return (
     <div style={{ background: '#181818', color: '#e0e0e0', borderRadius: 12, padding: 16, fontFamily: 'monospace', minHeight: 320, boxShadow: '0 2px 8px #0002', display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, maxHeight: 400 }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+        <button onClick={handleClearTerminal} style={{ borderRadius: 6, background: '#fff', color: '#e53e3e', fontWeight: 700, border: '1px solid #e53e3e', padding: '4px 12px', fontSize: 13, boxShadow: '0 1px 4px #0001' }}>Clear Terminal</button>
+      </div>
+      <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, maxHeight: panelHeight }}>
         {history.map((h, i) => (
           <div key={i} style={{ marginBottom: 10 }}>
             <div><span style={{ color: '#6cf' }}>$ {h.command}</span></div>
