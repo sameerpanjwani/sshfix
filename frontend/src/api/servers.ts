@@ -56,4 +56,9 @@ export const addChatMessage = async (id: number, role: 'user' | 'ai', message: s
 export const testServerConnection = async (id: number) => {
   const res = await axios.post(`${API_BASE}/servers/${id}/test`);
   return res.data;
-}; 
+};
+
+export async function getChatSessions(serverId: number) {
+  const res = await axios.get(`${API_BASE}/servers/${serverId}/chat-sessions`);
+  return res.data;
+} 

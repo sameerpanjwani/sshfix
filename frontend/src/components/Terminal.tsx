@@ -15,9 +15,10 @@ interface TerminalProps {
   onQuickCommandUsed?: () => void;
   panelHeight?: number;
   onGeminiSuggestion?: (suggestion: any) => void;
+  onHistoryUpdate?: (history: TerminalEntry[]) => void;
 }
 
-const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400, onGeminiSuggestion }) => {
+const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quickCommand, onQuickCommandUsed, panelHeight = 400, onGeminiSuggestion, onHistoryUpdate }) => {
   const [command, setCommand] = useState('');
   const [history, setHistory] = useState<TerminalEntry[]>(initialHistory);
   const [loading, setLoading] = useState(false);
@@ -29,7 +30,9 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
     try {
       const res = await runSSHCommand(serverId, toRun);
       const entry = { command: toRun, output: res.output, created_at: new Date().toISOString() };
-      setHistory([...history, entry]);
+      const newHistory = [...history, entry];
+      setHistory(newHistory);
+      if (typeof onHistoryUpdate === 'function') onHistoryUpdate(newHistory);
       setCommand('');
       // Call Gemini suggestion endpoint with last 3 terminal entries
       if (res.output && typeof onGeminiSuggestion === 'function') {
@@ -47,7 +50,9 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
         }
       }
     } catch (e: any) {
-      setHistory([...history, { command: toRun, output: e.message, created_at: new Date().toISOString() }]);
+      const newHistory = [...history, { command: toRun, output: e.message, created_at: new Date().toISOString() }];
+      setHistory(newHistory);
+      if (typeof onHistoryUpdate === 'function') onHistoryUpdate(newHistory);
     }
     setLoading(false);
   };
@@ -63,6 +68,7 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
 
   const handleClearTerminal = () => {
     setHistory([]);
+    if (typeof onHistoryUpdate === 'function') onHistoryUpdate([]);
   };
 
   return (

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { getAISuggestion, getAIAvailability, uploadImages } from '../api/ai';
-import { getChatHistory, addChatMessage } from '../api/servers';
+import { getChatHistory, addChatMessage, getChatSessions } from '../api/servers';
 
 const quickActions = [
   { label: 'List all files', value: 'ls -al' },
@@ -40,6 +40,9 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
   const [editImagePreviews, setEditImagePreviews] = useState<string[]>([]);
   const [editImageUrls, setEditImageUrls] = useState<string[]>([]);
   const [modalImage, setModalImage] = useState<string | null>(null);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [chatSessions, setChatSessions] = useState<any[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(false);
 
   useEffect(() => {
     getAIAvailability().then(setAIAvailable);
@@ -163,6 +166,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     setHistory([]);
     setPrompt('');
     setEstimatedTokens(null);
+    setGeminiSuggestions([]);
     setLoading(false);
   };
 
@@ -294,8 +298,30 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
       body: JSON.stringify({ entries, previousSuggestion: lastSuggestion })
     });
     const data = await res.json();
-    setGeminiSuggestions((prev: any[]) => prev.map((s, i) => i === prev.length - 1 ? { ...s, altSuggestion: data.json || { answer: data.response, commands: [] } } : s));
+    setGeminiSuggestions(geminiSuggestions.map((s, i) => i === geminiSuggestions.length - 1 ? { ...s, altSuggestion: data.json || { answer: data.response, commands: [] } } : s));
   }
+
+  const handleOpenHistoryModal = async () => {
+    setShowHistoryModal(true);
+    setLoadingSessions(true);
+    try {
+      const sessions = await getChatSessions(serverId);
+      setChatSessions(sessions);
+    } finally {
+      setLoadingSessions(false);
+    }
+  };
+
+  const handleLoadSession = async (session: any) => {
+    setLoading(true);
+    setShowHistoryModal(false);
+    const hist = await getChatHistory(serverId, session.date);
+    setHistory(hist);
+    setPrompt('');
+    setEstimatedTokens(null);
+    setGeminiSuggestions([]);
+    setLoading(false);
+  };
 
   return (
     <div
@@ -311,6 +337,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12 }}>
         <button onClick={handleNewSession} style={{ borderRadius: 8, background: '#fff', color: '#6cf', fontWeight: 700, border: '1px solid #6cf', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>New Chat Session</button>
+        <button onClick={handleOpenHistoryModal} style={{ borderRadius: 8, background: '#fff', color: '#2563eb', fontWeight: 700, border: '1px solid #2563eb', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>Load Chat History</button>
         {estimatedTokens !== null && (
           <div style={{ position: 'absolute', top: 16, right: 24, color: '#888', fontSize: 13, fontWeight: 500, zIndex: 2 }}>
             <span>Estimated tokens: {typeof estimatedTokens === 'number' ? estimatedTokens : 0}</span>
@@ -523,6 +550,32 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           <div style={{ position: 'relative', maxWidth: '90vw', maxHeight: '90vh' }} onClick={e => e.stopPropagation()}>
             <img src={modalImage.startsWith('data:') ? modalImage : ensureUploadUrl(modalImage)} alt="full preview" style={{ maxWidth: '90vw', maxHeight: '90vh', borderRadius: 12, boxShadow: '0 4px 32px #0008' }} />
             <button onClick={() => setModalImage(null)} style={{ position: 'absolute', top: 8, right: 8, background: '#fff', border: '1px solid #e53e3e', color: '#e53e3e', borderRadius: '50%', width: 32, height: 32, fontSize: 20, cursor: 'pointer', boxShadow: '0 2px 8px #0004' }}>×</button>
+          </div>
+        </div>
+      )}
+      {/* Chat History Modal */}
+      {showHistoryModal && (
+        <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.25)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: 16, boxShadow: '0 8px 32px #0004', padding: 32, minWidth: 340, maxWidth: 420, position: 'relative' }}>
+            <button onClick={() => setShowHistoryModal(false)} style={{ position: 'absolute', top: 12, right: 16, background: 'none', border: 'none', fontSize: 22, color: '#888', cursor: 'pointer' }}>&times;</button>
+            <h2 style={{ marginTop: 0, color: '#2563eb' }}>Select Chat Session</h2>
+            {loadingSessions ? (
+              <div style={{ color: '#888', marginTop: 16 }}>Loading...</div>
+            ) : chatSessions.length === 0 ? (
+              <div style={{ color: '#888', marginTop: 16 }}>No chat sessions found.</div>
+            ) : (
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+                {chatSessions.map((s, i) => (
+                  <li key={s.sessionId} style={{ marginBottom: 12, borderBottom: '1px solid #eee', paddingBottom: 8 }}>
+                    <button onClick={() => handleLoadSession(s)} style={{ background: '#e0e7ff', border: 'none', borderRadius: 8, padding: '8px 12px', width: '100%', textAlign: 'left', cursor: 'pointer' }}>
+                      <div style={{ fontWeight: 600, color: '#2563eb' }}>{s.date}</div>
+                      <div style={{ color: '#222', fontSize: 13, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.firstLine || <i>No user message</i>}</div>
+                      <div style={{ color: '#888', fontSize: 11, marginTop: 2 }}>Messages: {s.messagesCount}</div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </div>
       )}

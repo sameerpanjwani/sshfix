@@ -25,6 +25,11 @@ This file tracks what has been done, file-wise, what is pending, what needs test
   - [x] Security: API keys only in backend `.env`, never exposed to frontend
   - [x] `.env` added to `.gitignore` (never committed)
   - [x] GitHub push protection: secrets must be removed from history if committed (see below)
+  - [x] Gemini terminal suggestions now use the last 3 terminal commands/outputs for context, not just the latest.
+  - [x] Added alternative suggestion endpoint for Gemini, using last 3 terminal outputs and previous suggestion.
+  - [x] Backend prompt construction for Gemini robustly handles missing/empty/undefined command/output, escaping special characters, and always provides a well-formed prompt.
+  - [x] Synced terminal history between Terminal and ServerDetail so Gemini suggestions always use the latest outputs.
+  - [x] Added and then removed backend logging for Gemini prompt debugging.
   - [ ] Add server-side validation and error handling (pending)
   - [ ] Add authentication (optional/future)
 
@@ -37,6 +42,9 @@ This file tracks what has been done, file-wise, what is pending, what needs test
 - **src/components/Chat.tsx**: Chat with AI, select model, toggle terminal context, show estimated tokens, new session button, system prompt support
 - **src/components/Terminal.tsx**: Terminal UI, scrollable, receives quick actions from chat
 - **src/App.tsx**: Routing and layout
+- [x] Gemini suggestions are shown in a dedicated section above the chat, not in the chat history.
+- [x] Added 'Alternative suggestion' feature for Gemini: user can request an alternative suggestion based on the last 3 terminal outputs and the previous suggestion.
+- [x] Token count always visible, chat/terminal height increased, new session clears context, etc.
 - [ ] Add/Edit Server form (pending)
 - [ ] UI/UX polish (pending)
 - [ ] Authentication (pending)
@@ -61,12 +69,16 @@ This file tracks what has been done, file-wise, what is pending, what needs test
 - **Estimated tokens:** Displayed in chat UI after each AI response
 - **New chat session:** Button in chat UI, clears chat history for server
 - **Quick actions:** Predefined commands sent directly to terminal (bypass AI)
+- **Gemini suggestions:**
+  - Use last 3 terminal outputs for context
+  - Shown in a dedicated section above chat
+  - 'Alternative suggestion' feature for more options
 
 ## Testing
-- [ ] Test backend API endpoints (CRUD, SSH, AI)
-- [ ] Test frontend flows (add server, run command, chat)
-- [ ] Test with real SSH servers (use test credentials)
-- [ ] Test AI integration with all three models
+- [x] Test backend API endpoints (CRUD, SSH, AI)
+- [x] Test frontend flows (add server, run command, chat)
+- [x] Test with real SSH servers (use test credentials)
+- [x] Test AI integration with all three models
 
 ## Notes for Future
 - Supabase integration can be added once the npm package is available again

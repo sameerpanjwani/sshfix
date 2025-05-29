@@ -120,6 +120,7 @@ const ServerDetail: React.FC = () => {
             }}
             panelHeight={PANEL_HEIGHT}
             onGeminiSuggestion={handleGeminiSuggestion}
+            onHistoryUpdate={setHistory}
           />
         </div>
       </div>
