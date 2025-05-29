@@ -2,6 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { runSSHCommand } from '../api/ssh';
 import axios from 'axios';
 import { Terminal as XTerm } from 'xterm';
+import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 
 interface TerminalEntry {
@@ -36,13 +37,21 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
       fontSize: 15,
       theme: { background: '#181818', foreground: '#e0e0e0' },
       rows: 24,
-      cols: 80,
-      lineWrap: true
+      cols: 80
     });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
     xtermRef.current = term;
+    let resizeObserver: ResizeObserver | null = null;
     if (containerRef.current) {
       term.open(containerRef.current);
+      fitAddon.fit();
       term.focus();
+      // Add resize observer to fit terminal on container resize
+      resizeObserver = new window.ResizeObserver(() => {
+        fitAddon.fit();
+      });
+      resizeObserver.observe(containerRef.current);
     }
     // Show connecting message
     term.write('\x1b[33m[Connecting to SSH...]\x1b[0m\r\n');
@@ -137,6 +146,10 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
     return () => {
       ws.close();
       term.dispose();
+      // Clean up resize observer
+      if (resizeObserver && containerRef.current) {
+        resizeObserver.disconnect();
+      }
     };
   }, [serverId]); // Only re-run when serverId changes
 
