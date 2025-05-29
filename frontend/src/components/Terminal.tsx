@@ -31,11 +31,14 @@ const Terminal: React.FC<TerminalProps> = ({ serverId, initialHistory = [], quic
       const entry = { command: toRun, output: res.output, created_at: new Date().toISOString() };
       setHistory([...history, entry]);
       setCommand('');
-      // Call Gemini suggestion endpoint
+      // Call Gemini suggestion endpoint with last 3 terminal entries
       if (res.output && typeof onGeminiSuggestion === 'function') {
         try {
           const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
-          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { command: toRun, output: res.output });
+          // Get last 2 from history, plus the new one
+          const last2 = history.slice(-2);
+          const entries = [...last2, { command: toRun, output: res.output }];
+          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { entries, latestCommand: toRun });
           if (suggestRes.data && suggestRes.data.response) {
             onGeminiSuggestion(suggestRes.data);
           }

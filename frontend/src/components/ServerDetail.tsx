@@ -69,6 +69,11 @@ const ServerDetail: React.FC = () => {
     setGeminiSuggestions(prev => [...prev, suggestion]);
   };
 
+  // Helper to get last 3 terminal entries from history
+  const getLastTerminalEntries = () => {
+    return history.slice(-3);
+  };
+
   if (loading || !server) return <div>Loading...</div>;
 
   return (
@@ -99,6 +104,8 @@ const ServerDetail: React.FC = () => {
             setModel={setModel}
             sendToTerminal={setPendingTerminalCommand}
             geminiSuggestions={geminiSuggestions}
+            getLastTerminalEntries={getLastTerminalEntries}
+            setGeminiSuggestions={setGeminiSuggestions}
           />
         </div>
         {/* Terminal (Right) */}

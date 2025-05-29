@@ -620,11 +620,20 @@ app.use('/uploads', express.static(uploadDir));
 
 // --- Terminal Suggestion Endpoint (Gemini Flash) ---
 app.post('/api/ai/terminal-suggest', async (req, res) => {
-  const { command, output } = req.body;
+  const { entries, latestCommand, command, output } = req.body;
   try {
     const geminiApiKey = process.env.GEMINI_API_KEY;
     const geminiModel = 'gemini-2.5-flash-preview-04-17';
-    const prompt = `The user just ran this command in the terminal:\n\n$ ${command}\n\nOutput:\n${output}\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}`;
+    let prompt = '';
+    if (Array.isArray(entries) && entries.length > 0) {
+      prompt = 'The user just ran these recent commands in the terminal:\n';
+      entries.forEach((e, idx) => {
+        prompt += `\n${idx + 1}. $ ${e.command}\n   Output: ${e.output}`;
+      });
+      prompt += '\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}';
+    } else {
+      prompt = `The user just ran this command in the terminal:\n\n$ ${command}\n\nOutput:\n${output}\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}`;
+    }
     const geminiMessages = [
       {
         role: 'user',
@@ -656,6 +665,58 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
     });
   } catch (err) {
     console.error('Terminal Suggestion error:', err);
+    res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
+  }
+});
+
+// --- Alternative Terminal Suggestion Endpoint (Gemini Flash) ---
+app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
+  const { entries, previousSuggestion } = req.body;
+  try {
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const geminiModel = 'gemini-2.5-flash-preview-04-17';
+    let prompt = '';
+    if (Array.isArray(entries) && entries.length > 0 && previousSuggestion) {
+      prompt = 'The user just ran these recent commands in the terminal:\n';
+      entries.forEach((e, idx) => {
+        prompt += `\n${idx + 1}. $ ${e.command}\n   Output: ${e.output}`;
+      });
+      prompt += `\n\nThe previous suggestion was: ${JSON.stringify(previousSuggestion.json || previousSuggestion.response || previousSuggestion)}\n`;
+      prompt += 'Suggest an alternative next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}. Do not repeat the previous suggestion.';
+    } else {
+      return res.status(400).json({ error: 'Missing entries or previousSuggestion' });
+    }
+    const geminiMessages = [
+      {
+        role: 'user',
+        parts: [{ text: prompt }]
+      }
+    ];
+    const geminiPayload = {
+      contents: geminiMessages,
+      generationConfig: {
+        responseMimeType: 'application/json',
+      },
+    };
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
+      geminiPayload
+    );
+    let aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let aiJson = null;
+    try {
+      aiJson = JSON.parse(aiResponse);
+    } catch (e) {
+      aiJson = null;
+    }
+    res.json({
+      response: aiResponse,
+      json: aiJson,
+      model: 'gemini',
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('Terminal Alternative Suggestion error:', err);
     res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
   }
 });

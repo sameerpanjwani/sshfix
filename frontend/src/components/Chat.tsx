@@ -18,9 +18,11 @@ interface ChatProps {
   setModel: (m: 'openai' | 'gemini' | 'claude') => void;
   sendToTerminal?: (cmd: string) => void;
   geminiSuggestions?: any[];
+  getLastTerminalEntries?: () => any[];
+  setGeminiSuggestions: (s: any[]) => void;
 }
 
-const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, setModel, sendToTerminal, geminiSuggestions = [] }) => {
+const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, setModel, sendToTerminal, geminiSuggestions = [], getLastTerminalEntries, setGeminiSuggestions }) => {
   const [prompt, setPrompt] = useState('');
   const [history, setHistory] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
@@ -278,6 +280,23 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     }
   };
 
+  // Handler for alternative suggestion
+  async function handleAlternativeSuggestion() {
+    // Get the last Gemini suggestion and last 3 terminal entries
+    const lastSuggestion = geminiSuggestions[geminiSuggestions.length - 1];
+    if (!lastSuggestion || !getLastTerminalEntries) return;
+    const entries = getLastTerminalEntries();
+    // Call backend for alternative suggestion
+    const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
+    const res = await fetch(baseUrl + '/api/ai/terminal-suggest-alt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries, previousSuggestion: lastSuggestion })
+    });
+    const data = await res.json();
+    setGeminiSuggestions((prev: any[]) => prev.map((s, i) => i === prev.length - 1 ? { ...s, altSuggestion: data.json || { answer: data.response, commands: [] } } : s));
+  }
+
   return (
     <div
       style={{ background: '#f5f7fa', borderRadius: 12, padding: 16, minHeight: 320, boxShadow: '0 2px 8px #0001', display: 'flex', flexDirection: 'column', height: '100%' }}
@@ -305,10 +324,10 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
       </div>
       {/* Gemini Suggestions Tab Section */}
       {geminiSuggestions.length > 0 && (
-        <div style={{ marginBottom: 16, background: '#f0f4ff', borderRadius: 10, boxShadow: '0 1px 4px #0001', padding: 12, border: '1px solid #b6d0ff' }}>
-          <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 8 }}>
+        <div style={{ marginBottom: 16, background: '#f0f4ff', borderRadius: 10, boxShadow: '0 1px 4px #0001', padding: 12, border: '1px solid #b6d0ff', position: 'relative' }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, justifyContent: 'space-between' }}>
             <div style={{ fontWeight: 700, color: '#2563eb', fontSize: 16 }}>Gemini Suggestions</div>
-            {/* Future: add more tabs here */}
+            <span style={{ fontSize: 13, color: '#2563eb', background: '#f8fafc', borderRadius: 6, padding: '2px 10px', zIndex: 2, cursor: 'pointer', textDecoration: 'underline' }} onClick={handleAlternativeSuggestion}>Alternative suggestion</span>
           </div>
           <div style={{ maxHeight: 180, overflowY: 'auto' }}>
             {geminiSuggestions.slice(-3).reverse().map((s, idx) => {
@@ -332,6 +351,27 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                     </div>
                   )}
                   <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Gemini Flash • {s.created_at ? new Date(s.created_at).toLocaleString() : ''}</div>
+                  {/* Alternative suggestion display */}
+                  {s.altSuggestion && (
+                    <div style={{ marginTop: 10, background: '#e0e7ff', borderRadius: 8, padding: 10, color: '#222', fontSize: 14 }}>
+                      <div style={{ fontWeight: 600, color: '#3b82f6', marginBottom: 4 }}>Alternative Suggestion</div>
+                      <div>{s.altSuggestion.answer}</div>
+                      {s.altSuggestion.commands && s.altSuggestion.commands.length > 0 && (
+                        <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                          {s.altSuggestion.commands.map((cmd: string, cidx: number) => (
+                            <button
+                              key={cidx}
+                              style={{ fontFamily: 'monospace', fontSize: 13, padding: '4px 10px', borderRadius: 6, border: '1px solid #888', background: '#fff', cursor: 'pointer' }}
+                              onClick={() => handleCommandClick(cmd)}
+                              title="Send to terminal"
+                            >
+                              {cmd}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
