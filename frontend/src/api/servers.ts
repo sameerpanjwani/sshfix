@@ -40,4 +40,20 @@ export const getContext = async (id: number) => {
 export const setContext = async (id: number, key: string, value: string) => {
   const res = await axios.post(`${API_BASE}/servers/${id}/context`, { key, value });
   return res.data;
+};
+
+export const getChatHistory = async (id: number, date?: string) => {
+  const url = date ? `${API_BASE}/servers/${id}/chat?date=${date}` : `${API_BASE}/servers/${id}/chat`;
+  const res = await axios.get(url);
+  return res.data;
+};
+
+export const addChatMessage = async (id: number, role: 'user' | 'ai', message: string) => {
+  const res = await axios.post(`${API_BASE}/servers/${id}/chat`, { role, message });
+  return res.data;
+};
+
+export const testServerConnection = async (id: number) => {
+  const res = await axios.post(`${API_BASE}/servers/${id}/test`);
+  return res.data;
 }; 
