@@ -61,6 +61,10 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [showContextModal, setShowContextModal] = useState(false);
   const [contextToShow, setContextToShow] = useState<string | null>(null);
+  const [showExplanationModal, setShowExplanationModal] = useState(false);
+  const [explanationToShow, setExplanationToShow] = useState('');
+  const [explanationTitle, setExplanationTitle] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     getAIAvailability().then(setAIAvailable);
@@ -447,6 +451,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
             {geminiSuggestions.slice(-3).reverse().map((s, idx) => {
               const answer = s.json?.answer || s.response || '';
               const commands: string[] = s.json?.commands || [];
+              const explanations: string[] = s.json?.explanations || [];
               return (
                 <div key={idx} style={{ marginBottom: 12, background: '#fff', borderRadius: 8, padding: 10, boxShadow: '0 1px 2px #0001', border: '1px solid #e0e7ff', position: 'relative' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -469,20 +474,54 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                       </span>
                     )}
                   </div>
-                  {commands.length > 0 && (
-                    <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                      {commands.map((cmd: string, cidx: number) => (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
+                    {commands.map((cmd, cmdIdx) => (
+                      <div key={cmdIdx} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <button
-                          key={cidx}
-                          style={{ fontFamily: 'monospace', fontSize: 13, padding: '4px 10px', borderRadius: 6, border: '1px solid #888', background: '#f5f7fa', cursor: 'pointer' }}
                           onClick={() => handleCommandClick(cmd)}
-                          title="Send to terminal"
+                          style={{
+                            flex: 1,
+                            padding: '4px 8px',
+                            border: '1px solid #e0e7ff',
+                            borderRadius: 4,
+                            background: '#f5f3ff',
+                            color: '#4f46e5',
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                            fontFamily: 'monospace'
+                          }}
                         >
                           {cmd}
                         </button>
-                      ))}
-                    </div>
-                  )}
+                        {explanations[cmdIdx] && (
+                          <button
+                            onClick={() => {
+                              setExplanationTitle(cmd);
+                              setExplanationToShow(explanations[cmdIdx]);
+                              setShowExplanationModal(true);
+                            }}
+                            style={{
+                              border: 'none',
+                              background: 'none',
+                              color: '#6366f1',
+                              cursor: 'pointer',
+                              padding: '4px',
+                              borderRadius: '50%',
+                              width: 24,
+                              height: 24,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              fontSize: 14
+                            }}
+                            title="View command explanation"
+                          >
+                            ?
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                   <div style={{ color: '#888', fontSize: 12, marginTop: 4 }}>
                     Gemini Flash • {new Date(s.created_at || Date.now()).toLocaleTimeString()}
                   </div>
@@ -497,51 +536,75 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           const isAI = msg.role === 'ai';
           let answer = msg.message;
           let commands: string[] = [];
+          let explanations: string[] = [];
+          
           if (isAI && msg.json !== undefined) {
             // If we store json in history, use it
-            ({ answer, commands } = parseAIResponse(msg.message, msg.json));
+            answer = msg.json.answer || msg.message;
+            commands = msg.json.commands || [];
+            explanations = msg.json.explanations || [];
           } else if (isAI) {
-            ({ answer, commands } = parseAIResponse(msg.message, undefined));
+            try {
+              const parsed = JSON.parse(msg.message);
+              answer = parsed.answer || msg.message;
+              commands = parsed.commands || [];
+              explanations = parsed.explanations || [];
+            } catch {
+              answer = msg.message;
+              commands = [];
+              explanations = [];
+            }
           }
+
           return (
             <div key={msg.id || i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 10, opacity: msg.isGeminiSuggestion ? 0.95 : 1 }}>
-              <div style={{
-                background: msg.role === 'user' ? '#6cf' : '#e0e7ff',
-                color: msg.role === 'user' ? '#fff' : '#222',
-                borderRadius: 16,
-                padding: '8px 16px',
-                maxWidth: '70%',
-                boxShadow: '0 2px 8px #0001',
-                position: 'relative',
-                wordBreak: 'break-word',
+              <div style={{ 
+                maxWidth: '85%', 
+                padding: '8px 12px', 
+                borderRadius: 12,
+                background: msg.role === 'user' ? '#6366f1' : '#f3f4f6',
+                color: msg.role === 'user' ? '#fff' : '#111',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word'
               }}>
-                {/* Render answer for AI, or message for user */}
-                {isAI ? (
-                  <>
-                    {msg.isGeminiSuggestion && (
-                      <div style={{ fontSize: 12, color: '#3b82f6', fontWeight: 700, marginBottom: 2 }}>Gemini Suggestion</div>
-                    )}
-                    <div>{answer}</div>
-                    {commands && commands.length > 0 && (
-                      <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                        {commands.map((cmd, idx) => (
-                          <button
-                            key={idx}
-                            style={{ fontFamily: 'monospace', fontSize: 13, padding: '4px 10px', borderRadius: 6, border: '1px solid #888', background: '#fff', cursor: 'pointer' }}
-                            onClick={() => handleCommandClick(cmd)}
-                            title="Send to terminal"
+                {answer}
+                {isAI && commands.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    {commands.map((cmd, idx) => (
+                      <div key={idx} style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
+                        <button
+                          onClick={() => handleCommandClick(cmd)}
+                          style={{
+                            background: '#fff',
+                            border: '1px solid #e5e7eb',
+                            borderRadius: 6,
+                            padding: '4px 8px',
+                            cursor: 'pointer',
+                            color: '#111',
+                            fontFamily: 'monospace',
+                            fontSize: '0.9em',
+                            marginRight: 8,
+                            flex: 1
+                          }}
+                        >
+                          {cmd}
+                        </button>
+                        {explanations[idx] && (
+                          <span
+                            style={{ cursor: 'pointer', color: '#6366f1', marginLeft: 4, fontSize: 18 }}
+                            title="View command explanation"
+                            onClick={() => {
+                              setExplanationTitle(cmd);
+                              setExplanationToShow(explanations[idx]);
+                              setShowExplanationModal(true);
+                            }}
                           >
-                            {cmd}
-                          </button>
-                        ))}
+                            ?
+                          </span>
+                        )}
                       </div>
-                    )}
-                  </>
-                ) : (
-                  <div>{msg.message}</div>
-                )}
-                {msg.role === 'user' && editingMsgId !== msg.id && (
-                  <button style={{ marginLeft: 8, fontSize: 10, color: '#6cf', background: 'none', border: 'none', cursor: 'pointer' }} onClick={() => startEdit(msg, i)}>Edit/Retry</button>
+                    ))}
+                  </div>
                 )}
               </div>
               <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>
@@ -589,7 +652,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
             </div>
           );
         })}
-        <div ref={chatEndRef} />
+        <div ref={messagesEndRef} />
       </div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
         <div>
@@ -697,6 +760,49 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
               border: 'none', background: '#007bff', color: 'white', cursor: 'pointer'
             }}>
               Close
+            </button>
+          </div>
+        </div>
+      )}
+      {/* Explanation Modal */}
+      {showExplanationModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1000
+        }}>
+          <div style={{
+            backgroundColor: 'white',
+            padding: 20,
+            borderRadius: 8,
+            maxWidth: '80%',
+            maxHeight: '80%',
+            overflow: 'auto',
+            position: 'relative'
+          }}>
+            <h3 style={{ marginTop: 0, color: '#4f46e5' }}>{explanationTitle}</h3>
+            <p style={{ whiteSpace: 'pre-wrap', margin: '10px 0' }}>{explanationToShow}</p>
+            <button
+              onClick={() => setShowExplanationModal(false)}
+              style={{
+                position: 'absolute',
+                top: 10,
+                right: 10,
+                border: 'none',
+                background: 'none',
+                fontSize: '20px',
+                cursor: 'pointer',
+                color: '#6b7280'
+              }}
+            >
+              ×
             </button>
           </div>
         </div>

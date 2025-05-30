@@ -400,21 +400,41 @@ app.post('/api/ai', async (req, res) => {
     const defaultSystemPrompt =
       'You are an expert server assistant operating in a terminal environment. You can suggest shell commands for the user to run, and you will see the output of those commands. Your job is to help the user diagnose, fix, and automate server issues using the terminal. Always be safe, never suggest anything that could cause harm, data loss, or security issues. Explain your reasoning, ask for confirmation before any risky action, and help the user get things done efficiently.';
     // --- Add JSON output instruction ---
-    const jsonInstruction = `IMPORTANT: You MUST always respond in valid JSON format with exactly two fields:
+    const jsonInstruction = `IMPORTANT: You MUST always respond in valid JSON format with exactly these fields:
 1. "answer": A string containing your explanation, analysis, and advice
 2. "commands": An array of shell command strings that the user can run (provide practical, relevant commands even if not explicitly requested)
+3. "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
+   1. What the command does
+   2. Why it's relevant to the user's request or current context
+   3. What output to expect
+   4. Any potential errors to watch out for and how to handle them
 
 Example response format:
 {
   "answer": "I can see the issue. The disk is almost full at 98% capacity. Let me help you identify what is taking up space and clean it up.",
-  "commands": ["df -h", "du -sh /* 2>/dev/null | sort -h", "find /var/log -name '*.log' -mtime +30 -size +100M"]
+  "commands": ["df -h", "du -sh /* 2>/dev/null | sort -h", "find /var/log -name '*.log' -mtime +30 -size +100M"],
+  "explanations": [
+    "Shows disk space usage for all mounted filesystems in human-readable format. This will confirm which partitions are running low on space. Expect a table showing filesystem sizes, used space, and available space.",
+    "Lists disk usage for all top-level directories, sorted by size. The 2>/dev/null suppresses permission denied errors. You'll see directories listed from smallest to largest, helping identify space hogs.",
+    "Finds log files older than 30 days and larger than 100MB. These are often safe to compress or delete. The output will show paths to large, old log files that can be cleaned up."
+  ]
 }
 
-ALWAYS include relevant commands in the "commands" array, even if the user didn't explicitly ask for them. Do NOT include any text outside the JSON object.`;
+ALWAYS include relevant commands in the "commands" array and matching explanations in the "explanations" array, even if the user didn't explicitly ask for them. Do NOT include any text outside the JSON object.`;
     messages.push({ role: 'system', content: (systemPrompt || defaultSystemPrompt) + '\n\n' + jsonInstruction });
     if (withTerminalContext && terminalHistory.length > 0) {
       messages.push({ role: 'system', content: 'Recent terminal activity:' });
-      messages.push(...terminalHistory.reverse().map(h => ({ role: 'user', content: `$ ${h.command}\n${h.output}` })));
+      messages.push(...terminalHistory.reverse().map(h => {
+        const cmd = h.command || '';
+        const out = h.output || '';
+        // Look for common error patterns in the output
+        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
+        const outputPrefix = hasError ? 'Error Output:' : 'Output:';
+        // Increase truncation limit for error messages
+        const truncateLimit = hasError ? 2000 : 1000;
+        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
+        return { role: 'user', content: `$ ${cmd}\n${outputPrefix} ${truncatedOutput}` };
+      }));
     }
     // If editing, replace the last user message in chatHistory
     let userMsg = prompt;
@@ -555,12 +575,16 @@ ALWAYS include relevant commands in the "commands" array, even if the user didn'
           ...images.map(img => ({ inline_data: { mime_type: img.contentType, data: img.base64 } }))
         ];
       }
-      // Try to use responseMimeType for JSON output
+      // Try to use responseMimeType for JSON output with increased maxOutputTokens
       let geminiPayload = {
         contents: geminiMessages,
         generationConfig: {
-          responseMimeType: 'application/json',
-        },
+          temperature: 0.7,
+          topK: 40,
+          topP: 0.95,
+          maxOutputTokens: 8192,  // Increased from 1024 to 8192
+          stopSequences: []
+        }
       };
       let response;
       try {
@@ -575,8 +599,17 @@ ALWAYS include relevant commands in the "commands" array, even if the user didn'
           aiJson = null;
         }
       } catch (err) {
-        // If the API errors, fallback to prompt-based JSON
-        geminiPayload = { contents: geminiMessages };
+        // If the API errors, try again without responseMimeType
+        geminiPayload = { 
+          contents: geminiMessages,
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 8192,  // Increased here too
+            stopSequences: []
+          }
+        };
         response = await axios.post(
           `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
           geminiPayload
@@ -909,31 +942,38 @@ Recent command history (most recent last):
       const out = entry.output || '';
       prompt += `${i + 1}. Command: ${cmd}\n`;
       if (out.trim()) {
-        // Truncate long outputs
-        const truncatedOutput = out.length > 500 ? out.substring(0, 500) + '...' : out;
-        prompt += `   Output: ${truncatedOutput}\n`;
+        // Look for common error patterns in the output
+        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
+        const outputPrefix = hasError ? 'Error Output:' : 'Output:';
+        // Increase truncation limit for error messages to ensure we capture the full error
+        const truncateLimit = hasError ? 2000 : 1000;
+        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
+        prompt += `   ${outputPrefix} ${truncatedOutput}\n`;
       }
       prompt += '\n';
     });
 
     prompt += `Based on this command history, what would be a logical next command? Focus especially on the most recent command: "${actualLatestCommand}"
 
+If you see any errors in the command outputs above, suggest commands that would help fix those errors or provide alternatives that would work better.
+
 Provide your response as a JSON object with:
-- "answer": A brief explanation of what the suggested command does
+- "answer": A brief explanation of what the suggested command does, mentioning any errors seen and how to fix them
 - "commands": An array of 1-3 suggested commands (just the command strings)
-- "explanations": An array of detailed explanations for each command, matching the order of the commands array. Each explanation should describe:
+- "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
   1. What the command does
-  2. Why it's relevant after the previous command
+  2. Why it's relevant after the previous command (especially if fixing an error)
   3. What output to expect
+  4. Any potential errors to watch out for
 
 Example response:
 {
-  "answer": "After checking disk usage with df, let's examine which directories are using the most space",
-  "commands": ["du -sh /*", "ncdu /", "ls -laSh"],
+  "answer": "I noticed the previous command failed because 'ncdu' is not installed. Let's install it first, then try some alternative disk usage analysis commands.",
+  "commands": ["apt-get install ncdu -y", "du -sh /* 2>/dev/null | sort -h", "df -h"],
   "explanations": [
-    "The 'du -sh /*' command shows disk usage for each top-level directory, helping identify large directories.",
-    "ncdu is an interactive disk usage analyzer that lets you browse directories and see what's taking up space. You can navigate with arrow keys.",
-    "ls -laSh sorts files by size (largest first) and shows sizes in human-readable format. This helps spot large files in the current directory."
+    "Installs the ncdu package using apt-get. The -y flag automatically answers yes to prompts. If this fails, you might need to use sudo or a different package manager like yum or brew depending on your system.",
+    "Lists disk usage for all top-level directories, sorted by size in human-readable format. The 2>/dev/null suppresses permission denied errors. This is a good alternative to ncdu that works on all Unix systems.",
+    "Shows overall disk space usage for all mounted filesystems in human-readable format. This helps identify which partitions are running low on space."
   ]
 }`;
 
@@ -951,8 +991,8 @@ Example response:
           temperature: 0.7,
           topK: 40,
           topP: 0.95,
-          maxOutputTokens: 1024,
-          stopSequences: ["}"]
+          maxOutputTokens: 8192,  // Increased from 1024 to 8192
+          stopSequences: []
         }
       },
       {
@@ -970,41 +1010,106 @@ Example response:
 
     // Clean and parse the response
     let cleanedText = rawText.trim();
-    // Remove code block markers if present
-    if (cleanedText.startsWith('```json')) {
-      cleanedText = cleanedText.replace(/^```json\n?/, '').replace(/```$/, '');
-    } else if (cleanedText.startsWith('```')) {
-      cleanedText = cleanedText.replace(/^```\n?/, '').replace(/```$/, '');
-    }
-    cleanedText = cleanedText.trim();
     
-    try {
-      const parsedJson = JSON.parse(cleanedText + '}'); // Add closing brace if missing
-      if (!parsedJson.answer || !Array.isArray(parsedJson.commands) || !Array.isArray(parsedJson.explanations)) {
-        throw new Error('Invalid response format');
-      }
-      res.json({
-        response: parsedJson.answer,
-        json: parsedJson,
-        prompt: prompt // Include prompt for debugging
-      });
-    } catch (parseError) {
-      console.error('[TERMINAL-SUGGEST BACKEND] JSON parse error:', parseError, 'cleanedText:', cleanedText);
-      // Try to salvage the response if possible
+    // More robust JSON extraction
+    function extractJSON(text) {
+      // First try to find JSON between code blocks
+      let match = text.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+      if (match) return match[1].trim();
+      
+      // If no code blocks, try to find outermost { }
+      match = text.match(/\{[\s\S]*\}/);
+      if (match) return match[0].trim();
+      
+      // If still no match, return null
+      return null;
+    }
+
+    // Try to extract and parse JSON
+    const jsonText = extractJSON(cleanedText);
+    console.log('[TERMINAL-SUGGEST BACKEND] Extracted JSON:', jsonText);
+    
+    if (!jsonText) {
+      console.error('[TERMINAL-SUGGEST BACKEND] Could not extract JSON from response');
+      // Use fallback
       const fallbackJson = {
         answer: "Here are some suggested commands based on your recent activity",
         commands: ["ls -l", "pwd", "df -h"],
         explanations: [
-          "List files with detailed information including permissions and sizes",
-          "Show current working directory path",
-          "Show disk space usage in human-readable format"
+          "List files with details",
+          "Show current directory",
+          "Show disk usage"
         ]
       };
-      res.json({
+      return res.json({
         response: fallbackJson.answer,
         json: fallbackJson,
         prompt: prompt,
         error: 'Failed to parse Gemini response, using fallback suggestions'
+      });
+    }
+    
+    try {
+      const parsedJson = JSON.parse(jsonText);
+      
+      // Validate JSON structure
+      if (!parsedJson.answer || !Array.isArray(parsedJson.commands)) {
+        throw new Error('Invalid response format - missing required fields');
+      }
+      
+      // Clean up explanations - ensure they are strings
+      if (Array.isArray(parsedJson.explanations)) {
+        parsedJson.explanations = parsedJson.explanations.map(exp => {
+          if (typeof exp === 'string') return exp;
+          if (typeof exp === 'object') {
+            // If explanation is an object with numbered keys, join the values
+            return Object.values(exp).join(' ');
+          }
+          return String(exp); // Convert any other type to string
+        });
+      }
+      
+      // Ensure explanations exist and match commands length
+      if (!Array.isArray(parsedJson.explanations) || parsedJson.explanations.length !== parsedJson.commands.length) {
+        // Generate basic explanations if missing
+        parsedJson.explanations = parsedJson.commands.map(cmd => {
+          if (cmd.startsWith('ls')) return 'List directory contents with detailed information. This shows file permissions, sizes, and timestamps. Expect a detailed listing of files and directories.';
+          if (cmd.startsWith('cd')) return 'Change directory to explore contents. This moves you into the specified directory. Expect to be in the new directory after execution.';
+          if (cmd.startsWith('ps')) return 'Show running processes and their status. This displays information about active processes. Expect a list of processes with details like CPU and memory usage.';
+          if (cmd.startsWith('top')) return 'Monitor system processes in real-time. This shows a dynamic view of system resource usage. Expect an interactive display of process information that updates regularly.';
+          if (cmd.startsWith('df')) return 'Show disk space usage. This displays filesystem space utilization. Expect a list of mounted filesystems with their total, used, and available space.';
+          if (cmd.startsWith('du')) return 'Show directory space usage. This calculates disk usage of directories. Expect a list of directories with their total sizes.';
+          return `Execute the ${cmd} command. This will run in your current shell context. Check the output carefully before running any further commands.`;
+        });
+      }
+      
+      res.json({
+        response: parsedJson.answer,
+        json: parsedJson,
+        prompt: prompt
+      });
+    } catch (parseError) {
+      console.error('[TERMINAL-SUGGEST BACKEND] JSON parse error:', parseError, 'jsonText:', jsonText);
+      
+      // Try to salvage partial response if possible
+      const commandMatch = jsonText.match(/"commands":\s*\[(.*?)\]/s);
+      const answerMatch = jsonText.match(/"answer":\s*"([^"]+)"/);
+      
+      const salvaged = {
+        answer: answerMatch ? answerMatch[1] : "Here are some suggested commands based on your recent activity",
+        commands: commandMatch ? 
+          commandMatch[1].split(',')
+            .map(s => s.trim().replace(/^"|"$/g, ''))
+            .filter(s => s && !s.includes('"')) : 
+          ["ls -l", "pwd", "df -h"],
+        explanations: ["List files with details", "Show current directory", "Show disk usage"]
+      };
+      
+      res.json({
+        response: salvaged.answer,
+        json: salvaged,
+        prompt: prompt,
+        error: 'Partial parse of Gemini response'
       });
     }
     
@@ -1036,11 +1141,28 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
       chronologicalEntries.forEach((e, idx) => {
         const cmd = escapeForPrompt(e.command);
         const out = escapeForPrompt(e.output);
-        prompt += `\n${idx + 1}. $ ${cmd}\n   Output: ${out}`;
+        // Look for common error patterns in the output
+        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
+        const outputPrefix = hasError ? 'Error Output:' : 'Output:';
+        // Increase truncation limit for error messages
+        const truncateLimit = hasError ? 2000 : 1000;
+        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
+        prompt += `\n${idx + 1}. $ ${cmd}\n   ${outputPrefix} ${truncatedOutput}`;
       });
       const prev = typeof previousSuggestion === 'object' ? JSON.stringify(previousSuggestion.json || previousSuggestion.response || previousSuggestion) : escapeForPrompt(previousSuggestion);
       prompt += `\n\nThe previous suggestion was: ${prev}\n`;
-      prompt += `\nBased on the most recent command "${escapeForPrompt(entries[0]?.command || '')}", suggest an alternative next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}. Do not repeat the previous suggestion.`;
+      prompt += `\nBased on the most recent command "${escapeForPrompt(entries[0]?.command || '')}" and its output, suggest an alternative next best command or troubleshooting step. If you see any errors in the output, suggest commands that would help fix those errors or provide alternatives that would work better.
+
+Provide your response as a JSON object with:
+- "answer": A brief explanation of what the suggested command does, mentioning any errors seen and how to fix them
+- "commands": An array of 1-3 suggested commands (just the command strings)
+- "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
+  1. What the command does
+  2. Why it's relevant after the previous command (especially if fixing an error)
+  3. What output to expect
+  4. Any potential errors to watch out for and how to handle them
+
+Do not repeat the previous suggestion's commands.`;
     } else {
       return res.status(400).json({ error: 'Missing entries or previousSuggestion' });
     }
@@ -1053,8 +1175,12 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
     const geminiPayload = {
       contents: geminiMessages,
       generationConfig: {
-        responseMimeType: 'application/json',
-      },
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 8192,  // Increased from 1024 to 8192
+        stopSequences: []
+      }
     };
     let response;
     let aiResponse = '';
@@ -1071,8 +1197,17 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
         aiJson = null;
       }
     } catch (err) {
-      // If the API errors, fallback to prompt-based JSON
-      geminiPayload = { contents: geminiMessages };
+      // If the API errors, try again without responseMimeType
+      geminiPayload = { 
+        contents: geminiMessages,
+        generationConfig: {
+          temperature: 0.7,
+          topK: 40,
+          topP: 0.95,
+          maxOutputTokens: 8192,  // Increased here too
+          stopSequences: []
+        }
+      };
       response = await axios.post(
         `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
         geminiPayload
