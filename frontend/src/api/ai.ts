@@ -1,26 +1,36 @@
 import axios from 'axios';
 
-const API_BASE = 'http://localhost:4000/api';
+// In development, use localhost. In production, use relative path
+const API_BASE = window.location.hostname === 'localhost' ? 'http://localhost:4000' : '';
 
 export const getAISuggestion = async (
   prompt: string,
-  model: 'openai' | 'gemini' | 'gemini-pro' | 'claude',
-  serverId?: number,
-  withTerminalContext?: boolean,
-  newSession?: boolean,
+  model: string,
+  serverId: number,
+  chatSessionId: string | number | null,
+  withTerminalContext: boolean = false,
+  newSession: boolean = false,
   imageUrls?: string[],
-  edit?: boolean,
+  edit: boolean = false,
   messageId?: number
 ) => {
-  const res = await axios.post(`${API_BASE}/ai`, {
-    prompt, model, serverId, withTerminalContext, newSession, imageUrls, edit, messageId
+  const response = await axios.post(`${API_BASE}/api/ai`, {
+    prompt,
+    model,
+    serverId,
+    chatSessionId: chatSessionId?.toString() || Date.now().toString(),
+    withTerminalContext,
+    newSession,
+    imageUrls,
+    edit,
+    messageId
   });
-  return res.data;
+  return response.data;
 };
 
 export const getAIAvailability = async () => {
-  const res = await axios.get(`${API_BASE}/ai/available`);
-  return res.data;
+  const response = await axios.get(`${API_BASE}/api/ai/available`);
+  return response.data;
 };
 
 export const uploadImages = async (files: File[]) => {
@@ -35,13 +45,22 @@ export const uploadImages = async (files: File[]) => {
 // For explicit edit usage
 export const editAISuggestion = async (
   prompt: string,
-  model: 'openai' | 'gemini' | 'gemini-pro' | 'claude',
+  model: string,
   serverId: number,
+  chatSessionId: string | number | null,
   messageId: number,
   imageUrls?: string[]
 ) => {
-  const res = await axios.post(`${API_BASE}/ai`, {
-    prompt, model, serverId, imageUrls, edit: true, messageId
+  const response = await axios.post(`${API_BASE}/api/ai`, {
+    prompt,
+    model,
+    serverId,
+    chatSessionId: chatSessionId?.toString() || Date.now().toString(),
+    withTerminalContext: false,
+    newSession: false,
+    imageUrls,
+    edit: true,
+    messageId
   });
-  return res.data;
+  return response.data;
 }; 

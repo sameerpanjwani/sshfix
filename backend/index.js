@@ -141,7 +141,9 @@ CREATE TABLE IF NOT EXISTS chat_history (
   server_id INTEGER,
   role TEXT NOT NULL, -- 'user' or 'ai'
   message TEXT NOT NULL,
+  chat_session_id TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  ai_request_context TEXT,
   FOREIGN KEY(server_id) REFERENCES servers(id)
 );
 `);
@@ -367,24 +369,25 @@ app.post('/api/ai', async (req, res) => {
   if (!serverId) {
     return res.status(400).json({ error: 'serverId is required' });
   }
+  
   if (!chatSessionId) {
     return res.status(400).json({ error: 'chatSessionId is required' });
   }
 
-  try {
-    // No longer deleting history based on newSession flag from client for this endpoint.
-    // newSession is now handled by the client generating a new chatSessionId.
+  const sessionIdToUse = chatSessionId.toString();
+  console.log('[AI ENDPOINT] Using sessionId:', sessionIdToUse);
 
+  try {
     let chatHistory = [];
     // Fetch chat history for the current server and session
-    chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? AND chat_session_id = ? ORDER BY created_at ASC').all(serverId, chatSessionId);
+    chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? AND chat_session_id = ? ORDER BY created_at ASC').all(serverId, sessionIdToUse);
     // Exclude Gemini suggestion messages from AI context (if any were stored with session ID, though they shouldn't be)
     chatHistory = chatHistory.filter(m => m.role !== 'gemini-suggest');
 
     let terminalHistory = [];
     if (withTerminalContext) {
       // Get the timestamp of the first message in the current chat session
-      const firstMessageInSession = db.prepare('SELECT MIN(created_at) as session_start_time FROM chat_history WHERE server_id = ? AND chat_session_id = ?').get(serverId, chatSessionId);
+      const firstMessageInSession = db.prepare('SELECT MIN(created_at) as session_start_time FROM chat_history WHERE server_id = ? AND chat_session_id = ?').get(serverId, sessionIdToUse);
       const sessionStartTime = firstMessageInSession?.session_start_time || new Date(0).toISOString(); // Default to epoch if no messages in session yet
       
       // Fetch terminal history for the server created at or after the session start time
@@ -707,30 +710,30 @@ ALWAYS include relevant commands in the "commands" array, even if the user didn'
         // The AI response associated with this edit will be updated or created next.
         // We don't store ai_request_context for user messages.
         db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ? AND server_id = ? AND chat_session_id = ?')
-          .run(fullUserMsg, messageId, 'user', serverId, chatSessionId);
+          .run(fullUserMsg, messageId, 'user', serverId, sessionIdToUse);
         
         // Find the AI message that immediately followed the user message being edited
         // (assuming AI response is always logged after user message)
         const aiMsgToUpdate = db.prepare(
           'SELECT id FROM chat_history WHERE server_id = ? AND chat_session_id = ? AND role = ? AND id > ? ORDER BY created_at ASC LIMIT 1'
-        ).get(serverId, chatSessionId, 'ai', messageId);
+        ).get(serverId, sessionIdToUse, 'ai', messageId);
 
         if (aiMsgToUpdate) {
           db.prepare('UPDATE chat_history SET message = ?, ai_request_context = ? WHERE id = ? AND role = ? AND server_id = ? AND chat_session_id = ?')
-            .run(aiResponse, aiRequestContextString, aiMsgToUpdate.id, 'ai', serverId, chatSessionId);
+            .run(aiResponse, aiRequestContextString, aiMsgToUpdate.id, 'ai', serverId, sessionIdToUse);
         } else {
           // If no subsequent AI message, it might be a new AI response to an edited user message
           db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id, ai_request_context) VALUES (?, ?, ?, ?, ?)')
-            .run(serverId, 'ai', aiResponse, chatSessionId, aiRequestContextString);
+            .run(serverId, 'ai', aiResponse, sessionIdToUse, aiRequestContextString);
         }
       } else {
         // For new messages, insert both user and AI messages
         // User message does not get ai_request_context
         db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id) VALUES (?, ?, ?, ?)')
-          .run(serverId, 'user', fullUserMsg, chatSessionId);
+          .run(serverId, 'user', fullUserMsg, sessionIdToUse);
         // AI message gets the request context
         db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id, ai_request_context) VALUES (?, ?, ?, ?, ?)')
-          .run(serverId, 'ai', aiResponse, chatSessionId, aiRequestContextString);
+          .run(serverId, 'ai', aiResponse, sessionIdToUse, aiRequestContextString);
       }
     }
     res.json({ response: aiResponse, json: aiJson, estimatedTokens });
@@ -854,13 +857,24 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
     
     // If we have serverId and sessionId, fetch session-specific history from database
     let contextEntries = entries; // fallback to provided entries
+    let actualLatestCommand = latestCommand; // Store the actual latest command
     
     if (serverId && sessionId !== null && sessionId !== undefined && !isNaN(sessionId)) {
       try {
+        // Get unique commands by using GROUP BY and taking the most recent output for each command
         const sessionHistory = db.prepare(`
-          SELECT command, output 
-          FROM history 
-          WHERE server_id = ? AND chat_session_id = ? 
+          WITH RankedHistory AS (
+            SELECT 
+              command,
+              output,
+              created_at,
+              ROW_NUMBER() OVER (PARTITION BY command ORDER BY created_at DESC) as rn
+            FROM history 
+            WHERE server_id = ? AND chat_session_id = ?
+          )
+          SELECT command, output, created_at
+          FROM RankedHistory
+          WHERE rn = 1
           ORDER BY created_at DESC 
           LIMIT 6
         `).all(serverId, sessionId);
@@ -870,46 +884,9 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
             command: h.command || '',
             output: (h.output || '').slice(0, 1000)
           }));
-          console.log('[TERMINAL-SUGGEST BACKEND] Using session-specific history:', contextEntries.length, 'entries');
-        } else {
-          console.log('[TERMINAL-SUGGEST BACKEND] No session history found, falling back to recent history');
-          // Fall back to recent history if no session history found
-          const recentHistory = db.prepare(`
-            SELECT command, output 
-            FROM history 
-            WHERE server_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 6
-          `).all(serverId);
-          
-          if (recentHistory.length > 0) {
-            contextEntries = recentHistory.map(h => ({
-              command: h.command || '',
-              output: (h.output || '').slice(0, 1000)
-            }));
-            console.log('[TERMINAL-SUGGEST BACKEND] Using recent history:', contextEntries.length, 'entries');
-          }
-        }
-      } catch (dbError) {
-        console.error('[TERMINAL-SUGGEST BACKEND] Database error:', dbError);
-      }
-    } else if (serverId) {
-      // If no valid session ID but we have serverId, get the most recent commands
-      try {
-        const recentHistory = db.prepare(`
-          SELECT command, output 
-          FROM history 
-          WHERE server_id = ? 
-          ORDER BY created_at DESC 
-          LIMIT 6
-        `).all(serverId);
-        
-        if (recentHistory.length > 0) {
-          contextEntries = recentHistory.map(h => ({
-            command: h.command || '',
-            output: (h.output || '').slice(0, 1000)
-          }));
-          console.log('[TERMINAL-SUGGEST BACKEND] Using recent history (no session):', contextEntries.length, 'entries');
+          // Use the most recent command from database
+          actualLatestCommand = sessionHistory[0]?.command || latestCommand;
+          console.log('[TERMINAL-SUGGEST BACKEND] Using latest command from DB:', actualLatestCommand);
         }
       } catch (dbError) {
         console.error('[TERMINAL-SUGGEST BACKEND] Database error:', dbError);
@@ -917,8 +894,9 @@ app.post('/api/ai/terminal-suggest', async (req, res) => {
     }
     
     console.log('[TERMINAL-SUGGEST BACKEND] Final entries for context:', JSON.stringify(contextEntries, null, 2));
+    console.log('[TERMINAL-SUGGEST BACKEND] Final latest command:', actualLatestCommand);
 
-    // Build prompt for Gemini
+    // Build prompt for Gemini with enhanced command explanation requirements
     let prompt = `You are a helpful Linux system administrator assistant. Based on the recent terminal command history below, suggest the next logical command that the user might want to run.
 
 Recent command history (most recent last):
@@ -938,19 +916,25 @@ Recent command history (most recent last):
       prompt += '\n';
     });
 
-    // Get the actual most recent command from our entries
-    const mostRecentCommand = contextEntries[0]?.command || latestCommand;
-
-    prompt += `Based on this command history, what would be a logical next command? Focus especially on the most recent command: "${mostRecentCommand}"
+    prompt += `Based on this command history, what would be a logical next command? Focus especially on the most recent command: "${actualLatestCommand}"
 
 Provide your response as a JSON object with:
 - "answer": A brief explanation of what the suggested command does
 - "commands": An array of 1-3 suggested commands (just the command strings)
+- "explanations": An array of detailed explanations for each command, matching the order of the commands array. Each explanation should describe:
+  1. What the command does
+  2. Why it's relevant after the previous command
+  3. What output to expect
 
 Example response:
 {
-  "answer": "Based on the ls command, you might want to examine files or check disk usage",
-  "commands": ["cat filename.txt", "df -h", "du -sh *"]
+  "answer": "After checking disk usage with df, let's examine which directories are using the most space",
+  "commands": ["du -sh /*", "ncdu /", "ls -laSh"],
+  "explanations": [
+    "The 'du -sh /*' command shows disk usage for each top-level directory, helping identify large directories.",
+    "ncdu is an interactive disk usage analyzer that lets you browse directories and see what's taking up space. You can navigate with arrow keys.",
+    "ls -laSh sorts files by size (largest first) and shows sizes in human-readable format. This helps spot large files in the current directory."
+  ]
 }`;
 
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -995,8 +979,8 @@ Example response:
     cleanedText = cleanedText.trim();
     
     try {
-      const parsedJson = JSON.parse(cleanedText);
-      if (!parsedJson.answer || !Array.isArray(parsedJson.commands)) {
+      const parsedJson = JSON.parse(cleanedText + '}'); // Add closing brace if missing
+      if (!parsedJson.answer || !Array.isArray(parsedJson.commands) || !Array.isArray(parsedJson.explanations)) {
         throw new Error('Invalid response format');
       }
       res.json({
@@ -1009,7 +993,12 @@ Example response:
       // Try to salvage the response if possible
       const fallbackJson = {
         answer: "Here are some suggested commands based on your recent activity",
-        commands: ["ls -l", "pwd", "df -h"]
+        commands: ["ls -l", "pwd", "df -h"],
+        explanations: [
+          "List files with detailed information including permissions and sizes",
+          "Show current working directory path",
+          "Show disk space usage in human-readable format"
+        ]
       };
       res.json({
         response: fallbackJson.answer,
@@ -1113,16 +1102,31 @@ app.get('/api/servers/:id/chat-sessions', (req, res) => {
   const serverId = parseInt(req.params.id);
   try {
     const sessions = db.prepare(`
-      SELECT DISTINCT chat_session_id as sessionId, 
-             MIN(created_at) as startTime,
-             'Session ' || chat_session_id as label
+      SELECT DISTINCT 
+        chat_session_id as sessionId,
+        MIN(created_at) as startTime,
+        COUNT(*) as messageCount,
+        (SELECT message FROM chat_history ch2 
+         WHERE ch2.server_id = chat_history.server_id 
+         AND ch2.chat_session_id = chat_history.chat_session_id 
+         AND ch2.role = 'user' 
+         ORDER BY ch2.created_at ASC LIMIT 1) as firstMessage,
+        'Session ' || chat_session_id as label
       FROM chat_history 
       WHERE server_id = ? 
       GROUP BY chat_session_id 
       ORDER BY MIN(created_at) DESC
     `).all(serverId);
     
-    res.json(sessions);
+    // Format the sessions for frontend display
+    const formattedSessions = sessions.map(s => ({
+      ...s,
+      startTime: new Date(s.startTime).toISOString(),
+      messageCount: parseInt(s.messageCount),
+      firstMessage: s.firstMessage || 'No messages'
+    }));
+    
+    res.json(formattedSessions);
   } catch (error) {
     console.error('Error fetching chat sessions:', error);
     res.status(500).json({ error: 'Failed to fetch chat sessions' });
