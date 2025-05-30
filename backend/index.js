@@ -19,6 +19,90 @@ app.use(express.json());
 // Initialize SQLite database
 const db = new Database(path.join(__dirname, 'sshfix.db'));
 
+// --- Simple Migration System ---
+console.log('[DB_MIGRATE] Initializing migration system...');
+
+// 1. Ensure schema_migrations table exists
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  // console.log('[DB_MIGRATE] schema_migrations table ensured.');
+} catch (e) {
+  console.error('[DB_MIGRATE] FATAL: Could not create schema_migrations table:', e.message);
+  process.exit(1); // Exit if we can't manage migrations
+}
+
+// 2. Define Migrations
+const migrations = [
+  {
+    version: 1,
+    name: 'add_ai_request_context_to_chat_history',
+    query: `ALTER TABLE chat_history ADD COLUMN ai_request_context TEXT NULL`
+  },
+  {
+    version: 2,
+    name: 'add_chat_session_id_to_chat_history',
+    query: `ALTER TABLE chat_history ADD COLUMN chat_session_id TEXT NOT NULL DEFAULT 'default_session_0'`
+  },
+  {
+    version: 3,
+    name: 'add_chat_session_id_to_history',
+    query: `ALTER TABLE history ADD COLUMN chat_session_id INTEGER NULL`
+  },
+  {
+    version: 4,
+    name: 'cleanup_legacy_string_session_ids',
+    query: `DELETE FROM chat_history WHERE chat_session_id NOT GLOB '[0-9]*' OR LENGTH(chat_session_id) < 10`
+  }
+];
+
+// Global variable to track current chat session ID per server
+const currentChatSessions = new Map(); // serverId -> sessionId
+
+// 3. Apply Pending Migrations
+try {
+  for (const migration of migrations) {
+    const isAppliedStmt = db.prepare('SELECT version FROM schema_migrations WHERE version = ?');
+    const isApplied = isAppliedStmt.get(migration.version.toString());
+  
+    if (!isApplied) {
+      console.log(`[DB_MIGRATE] Applying migration: ${migration.name}...`);
+      try {
+        db.transaction(() => {
+          try {
+            db.prepare(migration.query).run();
+          } catch (innerErr) {
+            // If ALTER TABLE fails due to duplicate column, it means it was applied manually or by an older version of this code.
+            if (innerErr.message.includes('duplicate column name')) {
+              console.warn(`[DB_MIGRATE] Warning during ${migration.name}: Column already exists. Assuming applied.`);
+            } else {
+              throw innerErr; // Re-throw other errors
+            }
+          }
+          // If statement ran (or was duplicate), record the migration
+          db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(migration.version.toString());
+          console.log(`[DB_MIGRATE] Successfully applied and recorded migration: ${migration.name}`);
+        })();
+      } catch (err) {
+        console.error(`[DB_MIGRATE] Failed to apply migration ${migration.name}:`, err);
+        throw err;
+      }
+    } else {
+      console.log(`[DB_MIGRATE] Migration ${migration.name} already applied, skipping.`);
+    }
+  }
+  console.log('[DB_MIGRATE] All migrations checked.');
+} catch (err) {
+  console.error('[DB_MIGRATE] Migration failed:', err);
+  process.exit(1);
+}
+// --- End of Simple Migration System ---
+
+
 // Create tables if not exist
 // Servers table: id, name, host, port, username, password, privateKey, created_at
 // History table: id, server_id, command, output, created_at
@@ -110,16 +194,32 @@ app.delete('/api/servers/:id', (req, res) => {
 
 // API: List history for a server
 app.get('/api/servers/:id/history', (req, res) => {
-  const history = db.prepare('SELECT * FROM history WHERE server_id = ? ORDER BY created_at DESC').all(req.params.id);
+  const history = db.prepare('SELECT id, server_id, command, output, created_at, chat_session_id FROM history WHERE server_id = ? ORDER BY created_at DESC').all(req.params.id);
   res.json(history);
 });
 
 // API: Add history entry
 app.post('/api/servers/:id/history', (req, res) => {
+  const serverId = parseInt(req.params.id);
   const { command, output } = req.body;
-  const stmt = db.prepare('INSERT INTO history (server_id, command, output) VALUES (?, ?, ?)');
-  const info = stmt.run(req.params.id, command, output);
-  res.json({ id: info.lastInsertRowid });
+  const currentSessionId = currentChatSessions.get(serverId);
+  
+  // If no session is set, use null (which is fine for the database)
+  const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
+  
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO history (server_id, command, output, chat_session_id, created_at) 
+      VALUES (?, ?, ?, ?, datetime('now'))
+    `);
+    const result = stmt.run(serverId, command, output, sessionIdToUse);
+    
+    console.log(`[HISTORY] Added command "${command}" to server ${serverId}, session ${sessionIdToUse}`);
+    res.json({ id: result.lastInsertRowid, success: true });
+  } catch (error) {
+    console.error('Error adding history:', error);
+    res.status(500).json({ error: 'Failed to add history entry' });
+  }
 });
 
 // API: Get context for a server
@@ -197,63 +297,118 @@ function cleanAIResponse(str) {
 
 // API: Get chat history for a server, optionally by date
 app.get('/api/servers/:id/chat', (req, res) => {
-  const { date } = req.query;
-  let rows;
-  if (date) {
-    rows = db.prepare(`SELECT * FROM chat_history WHERE server_id = ? AND DATE(created_at) = ? ORDER BY created_at ASC`).all(req.params.id, date);
-  } else {
-    rows = db.prepare(`SELECT * FROM chat_history WHERE server_id = ? ORDER BY created_at ASC`).all(req.params.id);
+  const { date, sessionId } = req.query;
+  const serverId = req.params.id;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId query parameter is required' });
   }
-  // For AI messages, try to parse as JSON and add a 'json' field if valid
+
+  let query = `SELECT id, role, message, created_at, ai_request_context FROM chat_history WHERE server_id = ? AND chat_session_id = ?`;
+  const params = [serverId, sessionId];
+
+  if (date) {
+    query += ` AND DATE(created_at) = ?`;
+    params.push(date);
+  }
+  query += ` ORDER BY created_at ASC`;
+
+  const rows = db.prepare(query).all(...params);
+  
+  // For AI messages, try to parse the main message as JSON and add a 'json' field if valid
   const result = rows.map(msg => {
+    let processedMsg = { ...msg }; // Clone to avoid modifying original row object from DB
     if (msg.role === 'ai') {
       try {
-        const parsed = JSON.parse(cleanAIResponse(msg.message));
-        if (parsed && (typeof parsed === 'object') && (parsed.answer || parsed.commands)) {
-          return { ...msg, json: parsed };
+        const parsedJson = JSON.parse(cleanAIResponse(msg.message));
+        if (parsedJson && (typeof parsedJson === 'object') && (parsedJson.answer || parsedJson.commands)) {
+          processedMsg.json = parsedJson;
         }
-      } catch {}
+      } catch {
+        // If parsing fails, json field remains undefined, original message is still there
+      }
     }
-    return msg;
+    // ai_request_context is already selected, so it will be part of processedMsg if it exists
+    return processedMsg;
   });
   res.json(result);
 });
 
-// API: Add chat message to history
+// API: Add chat message to history (This endpoint might be deprecated or simplified if /api/ai handles all new message creations)
+// For now, ensure it also requires and uses chatSessionId if it's to be kept.
 app.post('/api/servers/:id/chat', (req, res) => {
-  const { role, message } = req.body;
+  const { role, message, chatSessionId } = req.body;
+  const serverId = req.params.id;
+
   if (!role || !message) return res.status(400).json({ error: 'role and message required' });
-  const stmt = db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)');
-  const info = stmt.run(req.params.id, role, message);
+  if (!serverId) return res.status(400).json({ error: 'serverId is required' });
+  if (!chatSessionId) return res.status(400).json({ error: 'chatSessionId is required in body' });
+
+  // User messages don't have ai_request_context. AI messages are now added via /api/ai.
+  // This endpoint should primarily be for user messages if still used directly.
+  let stmt;
+  let info;
+  if (role === 'user') {
+    stmt = db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id) VALUES (?, ?, ?, ?)');
+    info = stmt.run(serverId, role, message, chatSessionId);
+  } else {
+    // Direct insertion of AI messages here might bypass ai_request_context logging. Prefer /api/ai for AI messages.
+    return res.status(400).json({ error: 'AI messages should be created via /api/ai to include request context.'});
+  }
   res.json({ id: info.lastInsertRowid });
 });
 
 // Update AI Suggestion Endpoint to use and store chat history
 app.post('/api/ai', async (req, res) => {
-  const { prompt, model, serverId, withTerminalContext, newSession, systemPrompt, imageUrls, messageId, edit } = req.body;
+  const { prompt, model, serverId, chatSessionId, withTerminalContext, newSession, systemPrompt, imageUrls, messageId, edit } = req.body;
+  console.log('[AI ENDPOINT] Received model:', model, 'type:', typeof model, 'chatSessionId:', chatSessionId);
   console.log('[AI ENDPOINT] Received imageUrls:', imageUrls);
+
+  if (!serverId) {
+    return res.status(400).json({ error: 'serverId is required' });
+  }
+  if (!chatSessionId) {
+    return res.status(400).json({ error: 'chatSessionId is required' });
+  }
+
   try {
-    if (newSession && serverId) {
-      db.prepare('DELETE FROM chat_history WHERE server_id = ?').run(serverId);
-    }
+    // No longer deleting history based on newSession flag from client for this endpoint.
+    // newSession is now handled by the client generating a new chatSessionId.
+
     let chatHistory = [];
-    if (serverId) {
-      chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(serverId);
-      // Exclude Gemini suggestion messages from AI context
-      chatHistory = chatHistory.filter(m => m.role !== 'gemini-suggest');
-    }
+    // Fetch chat history for the current server and session
+    chatHistory = db.prepare('SELECT id, role, message FROM chat_history WHERE server_id = ? AND chat_session_id = ? ORDER BY created_at ASC').all(serverId, chatSessionId);
+    // Exclude Gemini suggestion messages from AI context (if any were stored with session ID, though they shouldn't be)
+    chatHistory = chatHistory.filter(m => m.role !== 'gemini-suggest');
+
     let terminalHistory = [];
-    if (withTerminalContext && serverId) {
-      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? ORDER BY created_at DESC LIMIT 6').all(serverId);
+    if (withTerminalContext) {
+      // Get the timestamp of the first message in the current chat session
+      const firstMessageInSession = db.prepare('SELECT MIN(created_at) as session_start_time FROM chat_history WHERE server_id = ? AND chat_session_id = ?').get(serverId, chatSessionId);
+      const sessionStartTime = firstMessageInSession?.session_start_time || new Date(0).toISOString(); // Default to epoch if no messages in session yet
+      
+      // Fetch terminal history for the server created at or after the session start time
+      terminalHistory = db.prepare('SELECT command, output FROM history WHERE server_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 10').all(serverId, sessionStartTime);
     }
+
     // Compose messages for AI API
-    const messages = [];
+    const messages = []; // This will be the full context sent to the AI
     // Add system prompt
     const defaultSystemPrompt =
       'You are an expert server assistant operating in a terminal environment. You can suggest shell commands for the user to run, and you will see the output of those commands. Your job is to help the user diagnose, fix, and automate server issues using the terminal. Always be safe, never suggest anything that could cause harm, data loss, or security issues. Explain your reasoning, ask for confirmation before any risky action, and help the user get things done efficiently.';
     // --- Add JSON output instruction ---
-    const jsonInstruction = 'Always respond in JSON with two fields: "answer" (string, your explanation and advice) and "commands" (array of shell commands the user could run, if any). Example: {"answer": "...", "commands": ["ls -la", "cat /etc/passwd"]}. Do not include any markdown or extra text.';
-    messages.push({ role: 'system', content: (systemPrompt || defaultSystemPrompt) + '\n' + jsonInstruction });
+    const jsonInstruction = `IMPORTANT: You MUST always respond in valid JSON format with exactly two fields:
+1. "answer": A string containing your explanation, analysis, and advice
+2. "commands": An array of shell command strings that the user can run (provide practical, relevant commands even if not explicitly requested)
+
+Example response format:
+{
+  "answer": "I can see the issue. The disk is almost full at 98% capacity. Let me help you identify what is taking up space and clean it up.",
+  "commands": ["df -h", "du -sh /* 2>/dev/null | sort -h", "find /var/log -name '*.log' -mtime +30 -size +100M"]
+}
+
+ALWAYS include relevant commands in the "commands" array, even if the user didn't explicitly ask for them. Do NOT include any text outside the JSON object.`;
+    messages.push({ role: 'system', content: (systemPrompt || defaultSystemPrompt) + '\n\n' + jsonInstruction });
     if (withTerminalContext && terminalHistory.length > 0) {
       messages.push({ role: 'system', content: 'Recent terminal activity:' });
       messages.push(...terminalHistory.reverse().map(h => ({ role: 'user', content: `$ ${h.command}\n${h.output}` })));
@@ -355,10 +510,17 @@ app.post('/api/ai', async (req, res) => {
       } catch (e) {
         aiJson = null;
       }
-    } else if (model === 'gemini') {
+    } else if (
+      model === 'gemini' ||
+      model === 'gemini-pro' ||
+      (typeof model === 'string' && model.toLowerCase().includes('gemini'))
+    ) {
       // Gemini 2.5 with image support and JSON mode if possible
       const geminiApiKey = process.env.GEMINI_API_KEY;
-      const geminiModel = 'gemini-2.5-flash-preview-04-17';
+      const geminiModel = (model === 'gemini-pro' || (typeof model === 'string' && model.toLowerCase().includes('pro')))
+        ? 'gemini-2.5-pro-preview-05-06'
+        : 'gemini-2.5-flash-preview-04-17';
+      console.log('[AI ENDPOINT] Using Gemini model:', geminiModel);
       let geminiMessages = messages
         .filter(m => m.role === 'user' || m.role === 'ai')
         .map(m => ({
@@ -368,7 +530,7 @@ app.post('/api/ai', async (req, res) => {
       // Prepend system prompt as first user message
       geminiMessages.unshift({
         role: 'user',
-        parts: [{ text: (systemPrompt || defaultSystemPrompt) + '\n' + jsonInstruction }]
+        parts: [{ text: (systemPrompt || defaultSystemPrompt) + '\n\n' + jsonInstruction }]
       });
       for (let i = 0; i < geminiMessages.length; i++) {
         if (geminiMessages[i].role === 'user') {
@@ -529,15 +691,46 @@ app.post('/api/ai', async (req, res) => {
     }
     // Store or update user prompt and AI response in chat_history if serverId is present
     if (serverId) {
+      // Create the full user message with image markdown
+      let fullUserMsg = prompt;
+      if (imageUrls && Array.isArray(imageUrls) && imageUrls.length > 0) {
+        fullUserMsg += '\n' + imageUrls.map(url => {
+          const finalUrl = url.startsWith('/uploads/') ? url : `/uploads/${url.replace(/^.*[\\/]/, '')}`;
+          return `![image](${finalUrl})`;
+        }).join(' ');
+      }
+      
+      const aiRequestContextString = JSON.stringify(messages);
+
       if (edit && messageId) {
-        db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(prompt, messageId, 'user');
-        const aiMsg = db.prepare('SELECT id FROM chat_history WHERE server_id = ? AND id > ? AND role = ? ORDER BY id ASC LIMIT 1').get(serverId, messageId, 'ai');
-        if (aiMsg) {
-          db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ?').run(aiResponse, aiMsg.id, 'ai');
+        // When editing, we update the user message.
+        // The AI response associated with this edit will be updated or created next.
+        // We don't store ai_request_context for user messages.
+        db.prepare('UPDATE chat_history SET message = ? WHERE id = ? AND role = ? AND server_id = ? AND chat_session_id = ?')
+          .run(fullUserMsg, messageId, 'user', serverId, chatSessionId);
+        
+        // Find the AI message that immediately followed the user message being edited
+        // (assuming AI response is always logged after user message)
+        const aiMsgToUpdate = db.prepare(
+          'SELECT id FROM chat_history WHERE server_id = ? AND chat_session_id = ? AND role = ? AND id > ? ORDER BY created_at ASC LIMIT 1'
+        ).get(serverId, chatSessionId, 'ai', messageId);
+
+        if (aiMsgToUpdate) {
+          db.prepare('UPDATE chat_history SET message = ?, ai_request_context = ? WHERE id = ? AND role = ? AND server_id = ? AND chat_session_id = ?')
+            .run(aiResponse, aiRequestContextString, aiMsgToUpdate.id, 'ai', serverId, chatSessionId);
+        } else {
+          // If no subsequent AI message, it might be a new AI response to an edited user message
+          db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id, ai_request_context) VALUES (?, ?, ?, ?, ?)')
+            .run(serverId, 'ai', aiResponse, chatSessionId, aiRequestContextString);
         }
       } else {
-        db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'user', prompt);
-        db.prepare('INSERT INTO chat_history (server_id, role, message) VALUES (?, ?, ?)').run(serverId, 'ai', aiResponse);
+        // For new messages, insert both user and AI messages
+        // User message does not get ai_request_context
+        db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id) VALUES (?, ?, ?, ?)')
+          .run(serverId, 'user', fullUserMsg, chatSessionId);
+        // AI message gets the request context
+        db.prepare('INSERT INTO chat_history (server_id, role, message, chat_session_id, ai_request_context) VALUES (?, ?, ?, ?, ?)')
+          .run(serverId, 'ai', aiResponse, chatSessionId, aiRequestContextString);
       }
     }
     res.json({ response: aiResponse, json: aiJson, estimatedTokens });
@@ -653,75 +846,185 @@ app.use('/uploads', express.static(uploadDir));
 // --- Terminal Suggestion Endpoint (Gemini Flash) ---
 // Accepts up to 6 recent terminal entries for context
 app.post('/api/ai/terminal-suggest', async (req, res) => {
-  const { entries, latestCommand, command, output } = req.body;
-  function escapeForPrompt(str) {
-    if (!str || typeof str !== 'string') return 'N/A';
-    return str.replace(/[`$\\]/g, match => '\\' + match).replace(/\u0000/g, '');
-  }
   try {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    const geminiModel = 'gemini-2.5-flash-preview-04-17';
-    let prompt = '';
-    if (Array.isArray(entries) && entries.length > 0) {
-      prompt = 'The user just ran these recent commands in the terminal:\n';
-      entries.forEach((e, idx) => {
-        const cmd = escapeForPrompt(e.command);
-        const out = escapeForPrompt(e.output);
-        prompt += `\n${idx + 1}. $ ${cmd}\n   Output: ${out}`;
-      });
-      prompt += '\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}';
-    } else {
-      prompt = `The user just ran this command in the terminal:\n\n$ ${escapeForPrompt(command)}\n\nOutput:\n${escapeForPrompt(output)}\n\nSuggest the next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}`;
-    }
-    const geminiMessages = [
-      {
-        role: 'user',
-        parts: [{ text: prompt }]
-      }
-    ];
-    const geminiPayload = {
-      contents: geminiMessages,
-      generationConfig: {
-        responseMimeType: 'application/json',
-      },
-    };
-    let response;
-    let aiResponse = '';
-    let aiJson = null;
-    try {
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        geminiPayload
-      );
-      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const { entries, latestCommand, serverId, sessionId } = req.body;
+    
+    console.log('[TERMINAL-SUGGEST BACKEND] Received latestCommand:', latestCommand);
+    console.log('[TERMINAL-SUGGEST BACKEND] Received serverId:', serverId, 'sessionId:', sessionId);
+    
+    // If we have serverId and sessionId, fetch session-specific history from database
+    let contextEntries = entries; // fallback to provided entries
+    
+    if (serverId && sessionId !== null && sessionId !== undefined && !isNaN(sessionId)) {
       try {
-        aiJson = JSON.parse(cleanAIResponse(aiResponse));
-      } catch (e) {
-        aiJson = null;
+        const sessionHistory = db.prepare(`
+          SELECT command, output 
+          FROM history 
+          WHERE server_id = ? AND chat_session_id = ? 
+          ORDER BY created_at DESC 
+          LIMIT 6
+        `).all(serverId, sessionId);
+        
+        if (sessionHistory.length > 0) {
+          contextEntries = sessionHistory.map(h => ({
+            command: h.command || '',
+            output: (h.output || '').slice(0, 1000)
+          }));
+          console.log('[TERMINAL-SUGGEST BACKEND] Using session-specific history:', contextEntries.length, 'entries');
+        } else {
+          console.log('[TERMINAL-SUGGEST BACKEND] No session history found, falling back to recent history');
+          // Fall back to recent history if no session history found
+          const recentHistory = db.prepare(`
+            SELECT command, output 
+            FROM history 
+            WHERE server_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 6
+          `).all(serverId);
+          
+          if (recentHistory.length > 0) {
+            contextEntries = recentHistory.map(h => ({
+              command: h.command || '',
+              output: (h.output || '').slice(0, 1000)
+            }));
+            console.log('[TERMINAL-SUGGEST BACKEND] Using recent history:', contextEntries.length, 'entries');
+          }
+        }
+      } catch (dbError) {
+        console.error('[TERMINAL-SUGGEST BACKEND] Database error:', dbError);
       }
-    } catch (err) {
-      // If the API errors, fallback to prompt-based JSON
-      geminiPayload = { contents: geminiMessages };
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        geminiPayload
-      );
-      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } else if (serverId) {
+      // If no valid session ID but we have serverId, get the most recent commands
       try {
-        aiJson = JSON.parse(cleanAIResponse(aiResponse));
-      } catch (e) {
-        aiJson = null;
+        const recentHistory = db.prepare(`
+          SELECT command, output 
+          FROM history 
+          WHERE server_id = ? 
+          ORDER BY created_at DESC 
+          LIMIT 6
+        `).all(serverId);
+        
+        if (recentHistory.length > 0) {
+          contextEntries = recentHistory.map(h => ({
+            command: h.command || '',
+            output: (h.output || '').slice(0, 1000)
+          }));
+          console.log('[TERMINAL-SUGGEST BACKEND] Using recent history (no session):', contextEntries.length, 'entries');
+        }
+      } catch (dbError) {
+        console.error('[TERMINAL-SUGGEST BACKEND] Database error:', dbError);
       }
     }
-    res.json({
-      response: aiResponse,
-      json: aiJson,
-      model: 'gemini',
-      created_at: new Date().toISOString(),
+    
+    console.log('[TERMINAL-SUGGEST BACKEND] Final entries for context:', JSON.stringify(contextEntries, null, 2));
+
+    // Build prompt for Gemini
+    let prompt = `You are a helpful Linux system administrator assistant. Based on the recent terminal command history below, suggest the next logical command that the user might want to run.
+
+Recent command history (most recent last):
+`;
+
+    // Add commands in chronological order (oldest to newest)
+    const chronologicalEntries = [...contextEntries].reverse();
+    chronologicalEntries.forEach((entry, i) => {
+      const cmd = entry.command || '';
+      const out = entry.output || '';
+      prompt += `${i + 1}. Command: ${cmd}\n`;
+      if (out.trim()) {
+        // Truncate long outputs
+        const truncatedOutput = out.length > 500 ? out.substring(0, 500) + '...' : out;
+        prompt += `   Output: ${truncatedOutput}\n`;
+      }
+      prompt += '\n';
     });
-  } catch (err) {
-    console.error('Terminal Suggestion error:', err);
-    res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
+
+    // Get the actual most recent command from our entries
+    const mostRecentCommand = contextEntries[0]?.command || latestCommand;
+
+    prompt += `Based on this command history, what would be a logical next command? Focus especially on the most recent command: "${mostRecentCommand}"
+
+Provide your response as a JSON object with:
+- "answer": A brief explanation of what the suggested command does
+- "commands": An array of 1-3 suggested commands (just the command strings)
+
+Example response:
+{
+  "answer": "Based on the ls command, you might want to examine files or check disk usage",
+  "commands": ["cat filename.txt", "df -h", "du -sh *"]
+}`;
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      console.error('[TERMINAL-SUGGEST BACKEND] GEMINI_API_KEY not found in environment');
+      return res.status(500).json({ error: 'Gemini API key not configured' });
+    }
+
+    const response = await axios.post(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=' + GEMINI_API_KEY,
+      {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          topK: 40,
+          topP: 0.95,
+          maxOutputTokens: 1024,
+          stopSequences: ["}"]
+        }
+      },
+      {
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    if (response.status !== 200) {
+      console.error('[TERMINAL-SUGGEST BACKEND] Gemini API error:', response.status, response.data);
+      return res.status(500).json({ error: 'Failed to get suggestions from Gemini' });
+    }
+
+    const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    console.log('[TERMINAL-SUGGEST BACKEND] Raw Gemini response:', rawText);
+
+    // Clean and parse the response
+    let cleanedText = rawText.trim();
+    // Remove code block markers if present
+    if (cleanedText.startsWith('```json')) {
+      cleanedText = cleanedText.replace(/^```json\n?/, '').replace(/```$/, '');
+    } else if (cleanedText.startsWith('```')) {
+      cleanedText = cleanedText.replace(/^```\n?/, '').replace(/```$/, '');
+    }
+    cleanedText = cleanedText.trim();
+    
+    try {
+      const parsedJson = JSON.parse(cleanedText);
+      if (!parsedJson.answer || !Array.isArray(parsedJson.commands)) {
+        throw new Error('Invalid response format');
+      }
+      res.json({
+        response: parsedJson.answer,
+        json: parsedJson,
+        prompt: prompt // Include prompt for debugging
+      });
+    } catch (parseError) {
+      console.error('[TERMINAL-SUGGEST BACKEND] JSON parse error:', parseError, 'cleanedText:', cleanedText);
+      // Try to salvage the response if possible
+      const fallbackJson = {
+        answer: "Here are some suggested commands based on your recent activity",
+        commands: ["ls -l", "pwd", "df -h"]
+      };
+      res.json({
+        response: fallbackJson.answer,
+        json: fallbackJson,
+        prompt: prompt,
+        error: 'Failed to parse Gemini response, using fallback suggestions'
+      });
+    }
+    
+  } catch (error) {
+    console.error('[TERMINAL-SUGGEST BACKEND] Error:', error?.response?.data || error);
+    res.status(500).json({ 
+      error: 'Failed to get suggestions',
+      details: error?.response?.data?.error || error.message
+    });
   }
 });
 
@@ -738,15 +1041,17 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
     const geminiModel = 'gemini-2.5-flash-preview-04-17';
     let prompt = '';
     if (Array.isArray(entries) && entries.length > 0 && previousSuggestion) {
-      prompt = 'The user just ran these recent commands in the terminal:\n';
-      entries.forEach((e, idx) => {
+      prompt = 'The user just ran these recent commands in the terminal (oldest to newest):\n';
+      // Show commands in chronological order
+      const chronologicalEntries = [...entries].reverse();
+      chronologicalEntries.forEach((e, idx) => {
         const cmd = escapeForPrompt(e.command);
         const out = escapeForPrompt(e.output);
         prompt += `\n${idx + 1}. $ ${cmd}\n   Output: ${out}`;
       });
       const prev = typeof previousSuggestion === 'object' ? JSON.stringify(previousSuggestion.json || previousSuggestion.response || previousSuggestion) : escapeForPrompt(previousSuggestion);
       prompt += `\n\nThe previous suggestion was: ${prev}\n`;
-      prompt += 'Suggest an alternative next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}. Do not repeat the previous suggestion.';
+      prompt += `\nBased on the most recent command "${escapeForPrompt(entries[0]?.command || '')}", suggest an alternative next best command or troubleshooting step as JSON: {"answer": "...", "commands": ["..."]}. Do not repeat the previous suggestion.`;
     } else {
       return res.status(400).json({ error: 'Missing entries or previousSuggestion' });
     }
@@ -795,6 +1100,7 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
       json: aiJson,
       model: 'gemini',
       created_at: new Date().toISOString(),
+      prompt: prompt
     });
   } catch (err) {
     console.error('Terminal Alternative Suggestion error:', err);
@@ -804,32 +1110,51 @@ app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
 
 // List chat sessions for a server (by date or session)
 app.get('/api/servers/:id/chat-sessions', (req, res) => {
-  const rows = db.prepare('SELECT id, role, message, created_at FROM chat_history WHERE server_id = ? ORDER BY created_at ASC').all(req.params.id);
-  if (!rows.length) return res.json([]);
-  const sessions = [];
-  let currentSession = null;
-  let lastTime = null;
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const time = new Date(row.created_at).getTime();
-    if (!lastTime || (time - lastTime > 60 * 60 * 1000)) { // New session if >1h gap
-      if (currentSession) sessions.push(currentSession);
-      currentSession = {
-        sessionId: row.id,
-        date: row.created_at.slice(0, 10),
-        firstLine: '',
-        firstMsgId: row.id,
-        messagesCount: 0
-      };
-    }
-    if (row.role === 'user' && !currentSession.firstLine) {
-      currentSession.firstLine = row.message.split('\n')[0].slice(0, 80);
-    }
-    currentSession.messagesCount++;
-    lastTime = time;
+  const serverId = parseInt(req.params.id);
+  try {
+    const sessions = db.prepare(`
+      SELECT DISTINCT chat_session_id as sessionId, 
+             MIN(created_at) as startTime,
+             'Session ' || chat_session_id as label
+      FROM chat_history 
+      WHERE server_id = ? 
+      GROUP BY chat_session_id 
+      ORDER BY MIN(created_at) DESC
+    `).all(serverId);
+    
+    res.json(sessions);
+  } catch (error) {
+    console.error('Error fetching chat sessions:', error);
+    res.status(500).json({ error: 'Failed to fetch chat sessions' });
   }
-  if (currentSession) sessions.push(currentSession);
-  res.json(sessions);
+});
+
+// Update chat session tracking endpoint
+app.post('/api/servers/:id/set-chat-session', (req, res) => {
+  const serverId = parseInt(req.params.id);
+  const { sessionId } = req.body;
+  
+  console.log(`[CHAT SESSION] Received sessionId: "${sessionId}" for server ${serverId}`);
+  
+  // Extract numeric session ID from string (e.g., "server-1-session-123" -> 123)
+  if (!sessionId || typeof sessionId !== 'string') {
+    console.error(`[CHAT SESSION] Invalid sessionId: ${sessionId}`);
+    return res.status(400).json({ error: 'Valid sessionId is required' });
+  }
+  
+  const parts = sessionId.split('-');
+  const lastPart = parts[parts.length - 1];
+  const numericSessionId = parseInt(lastPart);
+  
+  if (isNaN(numericSessionId)) {
+    console.error(`[CHAT SESSION] Could not parse numeric session ID from: ${sessionId}, lastPart: ${lastPart}`);
+    return res.status(400).json({ error: 'Could not parse numeric session ID' });
+  }
+  
+  currentChatSessions.set(serverId, numericSessionId);
+  
+  console.log(`[CHAT SESSION] Server ${serverId} now using session ${numericSessionId}`);
+  res.json({ success: true });
 });
 
 // --- WebSocket Interactive Terminal ---
@@ -877,8 +1202,18 @@ wss.on('connection', (ws, req) => {
         if (/[$#] $/.test(lastLine)) {
           // Command likely finished, log it
           if (commandBuffer.trim()) {
-            db.prepare('INSERT INTO history (server_id, command, output) VALUES (?, ?, ?)')
-              .run(serverId, commandBuffer.trim(), outputBuffer);
+            const currentSessionId = currentChatSessions.get(Number(serverId));
+            // Validate session ID before using it
+            const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
+            
+            try {
+              db.prepare('INSERT INTO history (server_id, command, output, chat_session_id) VALUES (?, ?, ?, ?)')
+                .run(serverId, commandBuffer.trim(), outputBuffer, sessionIdToUse);
+              console.log(`[TERMINAL] Logged command with session ID: ${sessionIdToUse}`);
+            } catch (error) {
+              console.error('[TERMINAL] Failed to log command:', error);
+            }
+            
             commandBuffer = '';
             outputBuffer = '';
           }

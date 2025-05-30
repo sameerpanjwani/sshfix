@@ -1,8 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { getAISuggestion, getAIAvailability, uploadImages } from '../api/ai';
+import { getAISuggestion, getAIAvailability, uploadImages, editAISuggestion } from '../api/ai';
 import { getChatHistory, addChatMessage, getChatSessions } from '../api/servers';
 import axios from 'axios';
+
+// Define ChatMessage interface including ai_request_context
+interface ChatMessage {
+  id?: number;
+  role: 'user' | 'ai' | 'system' | 'gemini-suggest';
+  message: string;
+  created_at: string;
+  model?: string; // For AI messages, to show which model responded
+  isGeminiSuggestion?: boolean;
+  json?: any; // Parsed JSON from AI response
+  ai_request_context?: string; // Full context sent to AI
+  imageUrls?: string[]; // URLs of images associated with the user message for easier re-edit
+}
 
 const quickActions = [
   { label: 'List all files', value: 'ls -al' },
@@ -15,20 +28,22 @@ interface ChatProps {
   onQuickCommand?: (command: string) => void;
   panelHeight?: number;
   serverId: number;
-  model: 'openai' | 'gemini' | 'claude';
-  setModel: (m: 'openai' | 'gemini' | 'claude') => void;
+  model: 'openai' | 'gemini' | 'gemini-pro' | 'claude';
+  setModel: (m: 'openai' | 'gemini' | 'gemini-pro' | 'claude') => void;
   sendToTerminal?: (cmd: string) => void;
   geminiSuggestions?: any[];
   getLastTerminalEntries?: () => any[];
   setGeminiSuggestions: (s: any[]) => void;
+  currentChatSessionId?: string | null;
+  onStartNewSession?: () => void;
 }
 
-const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, setModel, sendToTerminal, geminiSuggestions = [], getLastTerminalEntries, setGeminiSuggestions }) => {
+const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId, model, setModel, sendToTerminal, geminiSuggestions = [], getLastTerminalEntries, setGeminiSuggestions, currentChatSessionId, onStartNewSession }) => {
   const [prompt, setPrompt] = useState('');
-  const [history, setHistory] = useState<any[]>([]);
+  const [history, setHistory] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [aiAvailable, setAIAvailable] = useState<{openai: boolean, gemini: boolean, claude: boolean} | null>(null);
-  const withTerminalContext = true;
+  const [withTerminalContext, setWithTerminalContext] = useState(true);
   const [estimatedTokens, setEstimatedTokens] = useState<number | null>(null);
   const [newSession, setNewSession] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -44,16 +59,31 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [chatSessions, setChatSessions] = useState<any[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
+  const [showContextModal, setShowContextModal] = useState(false);
+  const [contextToShow, setContextToShow] = useState<string | null>(null);
 
   useEffect(() => {
     getAIAvailability().then(setAIAvailable);
   }, []);
 
   useEffect(() => {
-    if (serverId) {
-      getChatHistory(serverId).then(setHistory);
+    if (serverId && currentChatSessionId) {
+      setLoading(true);
+      setHistory([]); // Clear previous session's history before loading new one
+      getChatHistory(serverId, currentChatSessionId)
+        .then(data => {
+          setHistory(data || []); 
+          setLoading(false);
+        })
+        .catch(err => {
+          console.error(`Failed to load chat history for session ${currentChatSessionId}:`, err);
+          setHistory([]); // Ensure history is clear on error
+          setLoading(false);
+        });
+    } else {
+      setHistory([]); // Clear history if no serverId or sessionId, or if session ID is null
     }
-  }, [serverId]);
+  }, [serverId, currentChatSessionId]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -107,60 +137,74 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
   const ensureUploadUrl = (url: string) => url.startsWith('/uploads/') ? url : `/uploads/${url.replace(/^.*[\\/]/, '')}`;
 
   const handleSend = async () => {
-    if ((!prompt && images.length === 0) || !serverId) return;
+    if ((!prompt.trim() && images.length === 0) || !serverId || !currentChatSessionId) return;
     setLoading(true);
     
-    // Fetch latest terminal history from database before sending
-    let latestHistory = [];
-    try {
-      const historyResponse = await axios.get(`http://localhost:4000/api/servers/${serverId}/history`);
-      latestHistory = historyResponse.data || [];
-    } catch (e) {
-      console.error('Failed to fetch terminal history:', e);
-    }
-    
-    // Only include terminal context if we have recent commands
-    const hasRecentTerminalActivity = latestHistory.length > 0 && 
-      (new Date().getTime() - new Date(latestHistory[0].created_at).getTime() < 10 * 60 * 1000); // Within last 10 minutes
-    
-    let imageUrls: string[] = [];
+    let uploadedImageUrls: string[] = [];
     if (images.length > 0) {
       try {
-        imageUrls = await uploadImages(images);
+        uploadedImageUrls = await uploadImages(images);
       } catch (e) {
         setLoading(false);
         alert('Image upload failed.');
         return;
       }
     }
-    // Only add markdown for successfully uploaded images
-    let userMsg = prompt;
-    if (imageUrls.length > 0) {
-      userMsg += '\n' + imageUrls.map(url => `![image](${ensureUploadUrl(url)})`).join(' ');
-    }
-    await addChatMessage(serverId, 'user', userMsg);
-    setHistory([...history, { role: 'user', message: userMsg, created_at: new Date().toISOString() }]);
+    
+    const userMessageContent = prompt;
+    // Construct user message for optimistic UI update
+    const optimisticUserMessage: ChatMessage = {
+      // No ID yet, will get it after history refresh
+      role: 'user',
+      message: userMessageContent,
+      created_at: new Date().toISOString(),
+      imageUrls: uploadedImageUrls.map(ensureUploadUrl) 
+    };
+    setHistory(prev => [...prev, optimisticUserMessage]);
+    
+    // Clear input fields immediately
     setPrompt('');
     setImages([]);
     setImagePreviews([]);
-    // Always send imageUrls to backend, even if empty
+    
     try {
-      const res = await getAISuggestion(prompt, model as 'openai' | 'gemini' | 'claude', serverId, hasRecentTerminalActivity, newSession, imageUrls);
-      await addChatMessage(serverId, 'ai', res.response);
-      setHistory([...history, { role: 'user', message: userMsg, created_at: new Date().toISOString() }, { role: 'ai', message: res.response, created_at: new Date().toISOString() }]);
-      setEstimatedTokens(res.estimatedTokens || null);
-      setNewSession(false); // Reset after first message in new session
+      // Backend will save the user message and AI response with the chatSessionId
+      const res = await getAISuggestion(
+        userMessageContent, 
+        model,
+        serverId, 
+        currentChatSessionId, // Pass currentChatSessionId
+        withTerminalContext, 
+        false, // newSession flag is deprecated here, session is managed by ID
+        uploadedImageUrls, 
+        false, // edit flag
+        undefined // messageId for edit
+      );
+
+      // After AI response, refresh the entire chat history for the current session
+      // This ensures we get all messages with correct IDs and ai_request_context
+      if (serverId && currentChatSessionId) {
+        const updatedHistory = await getChatHistory(serverId, currentChatSessionId);
+        setHistory(updatedHistory || []);
+        // Try to find the estimatedTokens from the last AI message if backend provides it
+        const lastAiMsg = updatedHistory.findLast((m: ChatMessage) => m.role === 'ai');
+        if (lastAiMsg && typeof (lastAiMsg as any).estimatedTokens === 'number') {
+          setEstimatedTokens((lastAiMsg as any).estimatedTokens);
+        } else {
+          setEstimatedTokens(null);
+        }
+      }
     } catch (e: any) {
       let errorMsg = e?.response?.data?.error || e.message || 'Unknown error';
-      let tip = '';
-      if (e?.response?.status === 500) {
-        tip = '\nAI service failed. Check your API keys, backend logs, and network connectivity.';
-      }
-      setHistory([
-        ...history,
-        { role: 'user', message: userMsg, created_at: new Date().toISOString() },
-        { role: 'ai', message: errorMsg + (tip ? `\n${tip}` : ''), created_at: new Date().toISOString() }
-      ]);
+      const tip = e?.response?.status === 500 ? '\nAI service failed. Check API keys, backend logs, network.' : '';
+      const aiErrorResponse: ChatMessage = {
+        role: 'ai',
+        message: errorMsg + tip,
+        created_at: new Date().toISOString(),
+      };
+      // If AI call fails, ensure the optimistic user message is still in history, then add error.
+      // This replaces the optimistic message with itself if it's still the last one, then adds error.
+      setHistory(prev => prev.map(m => m === optimisticUserMessage ? optimisticUserMessage : m).concat([aiErrorResponse]));
       setEstimatedTokens(null);
     }
     setLoading(false);
@@ -174,15 +218,16 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     }
   };
 
-  const handleNewSession = async () => {
-    if (!serverId) return;
-    setLoading(true);
-    setNewSession(true);
-    setHistory([]);
-    setPrompt('');
-    setEstimatedTokens(null);
-    setGeminiSuggestions([]);
-    setLoading(false);
+  const handleNewSessionClick = () => {
+    if (onStartNewSession) {
+      onStartNewSession(); // This will trigger a change in currentChatSessionId prop
+      // The useEffect for [serverId, currentChatSessionId] will then clear and fetch history.
+      setEstimatedTokens(null);
+      setGeminiSuggestions([]); 
+      setPrompt('');
+      setImages([]);
+      setImagePreviews([]);
+    }
   };
 
   const noAIConfigured = aiAvailable && !aiAvailable.openai && !aiAvailable.gemini && !aiAvailable.claude;
@@ -235,46 +280,73 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     }
   };
 
-  const handleEditSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingMsgId || !serverId) return;
+  const handleEditSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!editingMsgId || !serverId || !currentChatSessionId) return;
+    if (!editPrompt.trim() && editImages.length === 0 && editImageUrls.length === 0) {
+      alert("Cannot save an empty message.");
+      return;
+    }
     setLoading(true);
-    let imageUrls: string[] = [...editImageUrls];
+    let uploadedEditImageUrls: string[] = [];
     if (editImages.length > 0) {
       try {
-        const uploaded = await uploadImages(editImages);
-        imageUrls = [...imageUrls, ...uploaded];
-      } catch (e) {
+        uploadedEditImageUrls = await uploadImages(editImages);
+      } catch (err) {
+        alert('Image upload failed during edit.');
         setLoading(false);
-        alert('Image upload failed.');
         return;
       }
     }
-    // Only add markdown for successfully uploaded images
-    let userMsg = editPrompt;
-    if (imageUrls.length > 0) {
-      userMsg += '\n' + imageUrls.map(url => `![image](${ensureUploadUrl(url)})`).join(' ');
-    }
-    // Always send imageUrls to backend, even if empty
+    const finalImageUrlsForEdit = [...editImageUrls, ...uploadedEditImageUrls];
+    const messageContentForEdit = editPrompt;
     try {
-      const res = await getAISuggestion(editPrompt, model as 'openai' | 'gemini' | 'claude', serverId, withTerminalContext, false, imageUrls, true, editingMsgId);
-      // Update history in-place
-      setHistory((hist: any[]) => hist.map((m: any, i: number) => {
-        if (m.id === editingMsgId) return { ...m, message: userMsg };
-        // Update the next AI message after this user message
-        if (i > 0 && hist[i - 1]?.id === editingMsgId && m.role === 'ai') return { ...m, message: res.response };
-        return m;
-      }));
-      setEstimatedTokens(res.estimatedTokens || null);
-      cancelEdit();
-    } catch (e: any) {
-      alert('Edit failed: ' + (e?.response?.data?.error || e.message));
-      setLoading(false);
+      await editAISuggestion(
+        messageContentForEdit,
+        model,
+        serverId,
+        currentChatSessionId, // Pass currentChatSessionId
+        editingMsgId,
+        finalImageUrlsForEdit
+      );
+      // After successful edit, refresh chat history for the current session
+      if (serverId && currentChatSessionId) {
+        const updatedHistory = await getChatHistory(serverId, currentChatSessionId);
+        setHistory(updatedHistory || []);
+        const lastAiMsg = updatedHistory.findLast((m: ChatMessage) => m.role === 'ai');
+        if (lastAiMsg && typeof (lastAiMsg as any).estimatedTokens === 'number') {
+          setEstimatedTokens((lastAiMsg as any).estimatedTokens);
+        } else {
+          setEstimatedTokens(null);
+        }
+      }
+    } catch (err: any) {
+      let errorMsg = err?.response?.data?.error || err.message || 'Unknown error';
+      alert(`Error saving edit: ${errorMsg}`);
     }
+    setEditingMsgId(null);
+    setEditPrompt('');
+    setEditImages([]);
+    setEditImagePreviews([]);
+    setEditImageUrls([]);
     setLoading(false);
   };
 
-  // --- Add helper to parse AI response ---
+  // Function to show context modal
+  const showAiContext = (context: string | undefined) => {
+    if (context) {
+      try {
+        // Attempt to parse and pretty-print if it's JSON
+        const parsedContext = JSON.parse(context);
+        setContextToShow(JSON.stringify(parsedContext, null, 2));
+      } catch (e) {
+        // If not JSON, show as is
+        setContextToShow(context);
+      }
+      setShowContextModal(true);
+    }
+  };
+
   function parseAIResponse(msg: string, json: any): { answer: string, commands: string[] } {
     if (json && typeof json === 'object' && (json.answer || json.commands)) {
       return { answer: json.answer || '', commands: json.commands || [] };
@@ -351,7 +423,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
         </div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 12 }}>
-        <button onClick={handleNewSession} style={{ borderRadius: 8, background: '#fff', color: '#6cf', fontWeight: 700, border: '1px solid #6cf', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>New Chat Session</button>
+        <button onClick={handleNewSessionClick} style={{ borderRadius: 8, background: '#fff', color: '#6cf', fontWeight: 700, border: '1px solid #6cf', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>New Chat Session</button>
         <button onClick={handleOpenHistoryModal} style={{ borderRadius: 8, background: '#fff', color: '#2563eb', fontWeight: 700, border: '1px solid #2563eb', padding: '6px 16px', fontSize: 14, boxShadow: '0 1px 4px #0001' }} disabled={loading}>Load Chat History</button>
         {estimatedTokens !== null && (
           <div style={{ position: 'absolute', top: 16, right: 24, color: '#888', fontSize: 13, fontWeight: 500, zIndex: 2 }}>
@@ -376,8 +448,27 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
               const answer = s.json?.answer || s.response || '';
               const commands: string[] = s.json?.commands || [];
               return (
-                <div key={idx} style={{ marginBottom: 12, background: '#fff', borderRadius: 8, padding: 10, boxShadow: '0 1px 2px #0001', border: '1px solid #e0e7ff' }}>
-                  <div style={{ color: '#222', marginBottom: 4 }}>{answer}</div>
+                <div key={idx} style={{ marginBottom: 12, background: '#fff', borderRadius: 8, padding: 10, boxShadow: '0 1px 2px #0001', border: '1px solid #e0e7ff', position: 'relative' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ color: '#222', marginBottom: 4 }}>{answer}</div>
+                    {/* (i) icon for Gemini suggestion context */}
+                    {s.prompt && (
+                      <span
+                        style={{ cursor: 'pointer', color: '#6366f1', marginLeft: 8, fontSize: 18 }}
+                        title="View full context sent to Gemini"
+                        onClick={() => {
+                          try {
+                            setContextToShow(JSON.stringify(JSON.parse(s.prompt), null, 2));
+                          } catch {
+                            setContextToShow(s.prompt);
+                          }
+                          setShowContextModal(true);
+                        }}
+                      >
+                        <b>i</b>
+                      </span>
+                    )}
+                  </div>
                   {commands.length > 0 && (
                     <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                       {commands.map((cmd: string, cidx: number) => (
@@ -392,28 +483,9 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                       ))}
                     </div>
                   )}
-                  <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Gemini Flash • {s.created_at ? new Date(s.created_at).toLocaleString() : ''}</div>
-                  {/* Alternative suggestion display */}
-                  {s.altSuggestion && (
-                    <div style={{ marginTop: 10, background: '#e0e7ff', borderRadius: 8, padding: 10, color: '#222', fontSize: 14 }}>
-                      <div style={{ fontWeight: 600, color: '#3b82f6', marginBottom: 4 }}>Alternative Suggestion</div>
-                      <div>{s.altSuggestion.answer}</div>
-                      {s.altSuggestion.commands && s.altSuggestion.commands.length > 0 && (
-                        <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                          {s.altSuggestion.commands.map((cmd: string, cidx: number) => (
-                            <button
-                              key={cidx}
-                              style={{ fontFamily: 'monospace', fontSize: 13, padding: '4px 10px', borderRadius: 6, border: '1px solid #888', background: '#fff', cursor: 'pointer' }}
-                              onClick={() => handleCommandClick(cmd)}
-                              title="Send to terminal"
-                            >
-                              {cmd}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <div style={{ color: '#888', fontSize: 12, marginTop: 4 }}>
+                    Gemini Flash • {new Date(s.created_at || Date.now()).toLocaleTimeString()}
+                  </div>
                 </div>
               );
             })}
@@ -477,8 +549,17 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                   ? 'You'
                   : msg.model === 'gemini' || msg.isGeminiSuggestion
                     ? 'Gemini AI'
-                    : `${model === 'openai' ? 'OpenAI' : model === 'gemini' ? 'Gemini' : model === 'claude' ? 'Claude' : 'AI'} AI`}
+                    : `${model === 'openai' ? 'OpenAI' : model === 'gemini' ? 'Gemini' : model === 'gemini-pro' ? 'Gemini Pro' : model === 'claude' ? 'Claude' : 'AI'} AI`}
                 {' • ' + new Date(msg.created_at).toLocaleString()}
+                {msg.role === 'ai' && msg.ai_request_context && (
+                  <span 
+                    onClick={() => showAiContext(msg.ai_request_context)}
+                    style={{ cursor: 'pointer', marginLeft: 8, fontWeight: 'bold', color: '#007bff' }} 
+                    title="View AI Prompt Context"
+                  >
+                    (i)
+                  </span>
+                )}
               </div>
               {editingMsgId === msg.id && (
                 <form onSubmit={handleEditSubmit} style={{ marginTop: 8, background: '#f0f4ff', borderRadius: 8, padding: 12, boxShadow: '0 1px 4px #0001' }}>
@@ -516,12 +597,13 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           <select
             id="model-select"
             value={model}
-            onChange={e => setModel(e.target.value as 'openai' | 'gemini' | 'claude')}
+            onChange={e => setModel(e.target.value as 'openai' | 'gemini' | 'gemini-pro' | 'claude')}
             style={{ marginRight: 8 }}
             title="AI Model"
           >
             <option value="openai" disabled={aiAvailable ? !aiAvailable.openai : false}>OpenAI GPT-4o</option>
             <option value="gemini" disabled={aiAvailable ? !aiAvailable.gemini : false}>Gemini Flash 2.5</option>
+            <option value="gemini-pro" disabled={aiAvailable ? !aiAvailable.gemini : false}>Gemini 2.5 Pro</option>
             <option value="claude" disabled={aiAvailable ? !aiAvailable.claude : false}>Claude Sonnet 4</option>
           </select>
         </div>
@@ -591,6 +673,31 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                 ))}
               </ul>
             )}
+          </div>
+        </div>
+      )}
+      {/* AI Request Context Modal */}
+      {showContextModal && contextToShow && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', 
+          backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', 
+          alignItems: 'center', justifyContent: 'center', zIndex: 1001
+        }} onClick={() => setShowContextModal(false)}>
+          <div style={{
+            background: 'white', padding: '20px', borderRadius: '8px', 
+            maxHeight: '80vh', overflowY: 'auto', minWidth: '300px', maxWidth: '70vw',
+            boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
+          }} onClick={e => e.stopPropagation()} /* Prevent modal from closing when clicking inside */ >
+            <h3 style={{ marginTop: 0, borderBottom: '1px solid #eee', paddingBottom: 10, marginBottom: 15 }}>AI Prompt Context</h3>
+            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: '#f5f5f5', padding: 15, borderRadius: 4 }}>
+              {contextToShow}
+            </pre>
+            <button onClick={() => setShowContextModal(false)} style={{
+              marginTop: '20px', padding: '10px 20px', borderRadius: '4px', 
+              border: 'none', background: '#007bff', color: 'white', cursor: 'pointer'
+            }}>
+              Close
+            </button>
           </div>
         </div>
       )}

@@ -4,7 +4,7 @@ const API_BASE = 'http://localhost:4000/api';
 
 export const getAISuggestion = async (
   prompt: string,
-  model: 'openai' | 'gemini' | 'claude',
+  model: 'openai' | 'gemini' | 'gemini-pro' | 'claude',
   serverId?: number,
   withTerminalContext?: boolean,
   newSession?: boolean,
@@ -35,7 +35,7 @@ export const uploadImages = async (files: File[]) => {
 // For explicit edit usage
 export const editAISuggestion = async (
   prompt: string,
-  model: 'openai' | 'gemini' | 'claude',
+  model: 'openai' | 'gemini' | 'gemini-pro' | 'claude',
   serverId: number,
   messageId: number,
   imageUrls?: string[]

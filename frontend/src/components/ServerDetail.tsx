@@ -1,11 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getServer, getHistory, testServerConnection } from '../api/servers';
+import { getServer, getHistory, testServerConnection, getChatSessions } from '../api/servers';
 import Chat from './Chat';
 import InteractiveTerminal from './Terminal';
 import axios from 'axios';
 
 const PANEL_HEIGHT = 700; // px, shared height for chat and terminal
+
+// Define SessionInfo interface
+interface SessionInfo {
+  sessionId: string;
+  startTime: string;
+  label: string;
+}
 
 const ServerDetail: React.FC = () => {
   const { id } = useParams();
@@ -16,17 +23,119 @@ const ServerDetail: React.FC = () => {
   const [testResult, setTestResult] = useState<any>(null);
   const [testing, setTesting] = useState(false);
   const [quickCommand, setQuickCommand] = useState<string | null>(null);
-  const [model, setModel] = useState<'openai' | 'gemini' | 'claude'>('openai');
+  const [model, setModel] = useState<'openai' | 'gemini' | 'gemini-pro' | 'claude'>('openai');
   const [pendingTerminalCommand, setPendingTerminalCommand] = useState<string | null>(null);
   const [geminiSuggestions, setGeminiSuggestions] = useState<any[]>([]);
+  const [terminalClearSignal, setTerminalClearSignal] = useState(0);
+  const timeoutIdRef = useRef<number | null>(null); // For managing the timeout (browser uses number)
+
+  // New state for chat sessions - now using numeric session IDs
+  const [currentChatSessionId, setCurrentChatSessionId] = useState<number | null>(null);
+  const [availableChatSessions, setAvailableChatSessions] = useState<SessionInfo[]>([]);
+
+  // Refs to hold the latest session state for use in setTimeout
+  const currentChatSessionIdRef = useRef(currentChatSessionId);
+  const availableChatSessionsRef = useRef(availableChatSessions);
+
+  useEffect(() => {
+    currentChatSessionIdRef.current = currentChatSessionId;
+  }, [currentChatSessionId]);
+
+  useEffect(() => {
+    availableChatSessionsRef.current = availableChatSessions;
+  }, [availableChatSessions]);
+
+  // Notify backend of current session when it changes
+  useEffect(() => {
+    if (id && currentChatSessionId !== null && !isNaN(currentChatSessionId) && currentChatSessionId > 0) {
+      const sessionString = `server-${Number(id)}-session-${currentChatSessionId}`;
+      const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
+      
+      console.log(`[ServerDetail.tsx] Sending session ID to backend: ${sessionString} (sessionId: ${currentChatSessionId})`);
+      
+      axios.post(`${baseUrl}/api/servers/${id}/set-chat-session`, {
+        sessionId: sessionString
+      }).then(() => {
+        console.log(`[ServerDetail.tsx] Successfully set backend chat session to ${currentChatSessionId}`);
+      }).catch(error => {
+        console.error('[ServerDetail.tsx] Error setting chat session:', error);
+      });
+    } else {
+      console.log(`[ServerDetail.tsx] Skipping session setup - id: ${id}, sessionId: ${currentChatSessionId}, valid: ${currentChatSessionId !== null && !isNaN(currentChatSessionId) && currentChatSessionId > 0}`);
+    }
+  }, [id, currentChatSessionId]);
 
   useEffect(() => {
     if (id) {
-      getServer(Number(id)).then(setServer);
-      getHistory(Number(id)).then(setHistory);
-      setLoading(false);
+      const serverId = Number(id);
+      setLoading(true);
+      setCurrentChatSessionId(null); // Reset while loading new server data
+      setAvailableChatSessions([]);
+      setGeminiSuggestions([]); // Clear suggestions for new server
+      setHistory([]); // Clear terminal history for new server
+
+      Promise.all([
+        getServer(serverId),
+        getHistory(serverId),
+        getChatSessions(serverId) // Fetch available chat sessions
+      ]).then(([serverData, historyData, sessionsData]) => {
+        setServer(serverData);
+        setHistory(historyData);
+
+        const loadedSessions = sessionsData || [];
+        
+        // Filter out sessions with non-numeric session IDs (legacy data)
+        const numericSessions = loadedSessions.filter((s: SessionInfo) => {
+          const parsed = parseInt(s.sessionId);
+          return !isNaN(parsed) && parsed > 0;
+        });
+
+        console.log('[ServerDetail.tsx] Loaded sessions:', loadedSessions);
+        console.log('[ServerDetail.tsx] Numeric sessions:', numericSessions);
+
+        if (numericSessions.length > 0) {
+          setAvailableChatSessions(numericSessions);
+          const latestSessionId = parseInt(numericSessions[0].sessionId);
+          console.log('[ServerDetail.tsx] Setting session ID to:', latestSessionId);
+          setCurrentChatSessionId(latestSessionId); // Load most recent numeric session from DB
+        } else {
+          // No existing numeric sessions in DB, generate a new one client-side
+          const newSessionId = Date.now(); // Use timestamp as unique ID
+          console.log('[ServerDetail.tsx] Creating new session ID:', newSessionId);
+          setCurrentChatSessionId(newSessionId);
+          const newClientSession = { 
+            sessionId: newSessionId.toString(), 
+            startTime: new Date().toISOString(), 
+            label: `Session ${newSessionId}` 
+          };
+          setAvailableChatSessions([newClientSession]);
+        }
+        setLoading(false);
+      }).catch(error => {
+        console.error("Error loading server details:", error);
+        setLoading(false);
+        // Handle error state appropriately, e.g., show error message to user
+      });
     }
   }, [id]);
+
+  const handleStartNewChatSession = () => {
+    if (id) {
+      const newSessionId = Date.now(); // Use timestamp as unique session ID
+      setCurrentChatSessionId(newSessionId);
+      const newSessionEntry = { 
+        sessionId: newSessionId.toString(), 
+        startTime: new Date().toISOString(), 
+        label: `Session ${newSessionId}` 
+      };
+      setAvailableChatSessions(prevSessions => [
+        newSessionEntry,
+        ...prevSessions.filter(s => s.sessionId !== newSessionId.toString()) 
+      ]);
+      setGeminiSuggestions([]); // Clear suggestions for new session
+      setTerminalClearSignal(prev => prev + 1); // Increment to trigger terminal clear
+    }
+  };
 
   const handleTestConnection = async () => {
     if (!id) return;
@@ -77,50 +186,69 @@ const ServerDetail: React.FC = () => {
 
   // Enhanced onHistoryUpdate: update history and fetch Gemini suggestion
   const handleHistoryUpdate = async (newHistory: any[]) => {
-    setHistory(newHistory);
-    
-    // Debounce Gemini suggestions to avoid too many API calls
-    if (handleHistoryUpdate.timeout) {
-      clearTimeout(handleHistoryUpdate.timeout);
+    setHistory(newHistory); // Store global history
+    if (timeoutIdRef.current) {
+      clearTimeout(timeoutIdRef.current);
     }
-    
-    handleHistoryUpdate.timeout = setTimeout(async () => {
-      // Call Gemini suggestion endpoint with last 6 entries
+    timeoutIdRef.current = setTimeout(async () => {
       try {
-        const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
-        const entries = newHistory.slice(-6).map(e => ({
-          command: e.command || '',
-          output: (e.output || '').slice(0, 1000) // Limit output size
-        }));
+        const capturedSessionId = currentChatSessionIdRef.current;
+        const capturedAvailableSessions = availableChatSessionsRef.current;
         
-        if (entries.length > 0) {
-          const suggestRes = await axios.post(baseUrl + '/api/ai/terminal-suggest', { 
-            entries, 
-            latestCommand: entries[entries.length - 1].command 
-          });
-          
-          if (suggestRes.data && (suggestRes.data.response || suggestRes.data.json)) {
-            setGeminiSuggestions(prev => {
-              // Avoid duplicate suggestions
-              const lastSuggestion = prev[prev.length - 1];
-              if (lastSuggestion && lastSuggestion.response === suggestRes.data.response) {
-                return prev;
-              }
-              // Keep only last 10 suggestions to avoid memory issues
-              return [...prev.slice(-9), suggestRes.data];
-            });
-          }
+        if (capturedSessionId === null) {
+          console.log('[ServerDetail.tsx] No current session ID, skipping suggestions');
+          return;
         }
-      } catch (err) {
-        console.error('Gemini suggestion error:', err);
-        // Don't show error to user, Gemini suggestions are optional
+        
+        const currentSession = capturedAvailableSessions.find(s => s.sessionId === capturedSessionId.toString());
+        
+        if (!currentSession) {
+          console.log('[ServerDetail.tsx] No current session found, skipping suggestions');
+          return;
+        }
+        
+        console.log(`[ServerDetail.tsx] Using session-based filtering for session ${capturedSessionId}`);
+        
+        const sessionIdStr = currentSession.sessionId?.toString();
+        const sessionHistory = newHistory.filter(e => 
+          e.chat_session_id?.toString() === sessionIdStr
+        );
+        const entriesForSuggestion = sessionHistory.slice(-6).reverse().map(e => ({
+          command: e.command || '',
+          output: (e.output || '').slice(0, 1000)
+        }));
+
+        if (entriesForSuggestion.length === 0) {
+          console.log('[ServerDetail.tsx] No commands available for suggestions');
+          return;
+        }
+
+        const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
+        const latestCommand = newHistory.length > 0 ? (newHistory[newHistory.length - 1].command || '') : '';
+        
+        console.log(`[ServerDetail.tsx] Sending suggestion request for session ${capturedSessionId}`);
+        
+        const response = await axios.post(baseUrl + '/api/ai/terminal-suggest', {
+          entries: entriesForSuggestion,
+          latestCommand: latestCommand,
+          serverId: Number(id),
+          sessionId: capturedSessionId
+        });
+        
+        if (response.data && (response.data.response || response.data.json)) {
+          setGeminiSuggestions(prev => {
+            const newSuggestions = [...prev, response.data].slice(-3); // Keep last 3
+            return newSuggestions;
+          });
+        } else if (response.data && response.data.error) {
+          console.error('[ServerDetail.tsx] Backend error for terminal suggestion:', response.data.error);
+        }
+      } catch (error) {
+        console.error('[ServerDetail.tsx] Error fetching Gemini suggestion:', error);
       }
-    }, 1000); // Wait 1 second after last update before calling API
+    }, 300);
   };
   
-  // Add static property for timeout
-  handleHistoryUpdate.timeout = null as any;
-
   if (loading || !server) return <div>Loading...</div>;
 
   return (
@@ -153,6 +281,8 @@ const ServerDetail: React.FC = () => {
             geminiSuggestions={geminiSuggestions}
             getLastTerminalEntries={getLastTerminalEntries}
             setGeminiSuggestions={setGeminiSuggestions}
+            currentChatSessionId={currentChatSessionId?.toString() || null}
+            onStartNewSession={handleStartNewChatSession}
           />
         </div>
         {/* Terminal (Right) */}
@@ -166,6 +296,7 @@ const ServerDetail: React.FC = () => {
               setQuickCommand(null);
             }}
             onHistoryUpdate={handleHistoryUpdate}
+            clearSignal={terminalClearSignal}
           />
         </div>
       </div>

@@ -42,14 +42,20 @@ export const setContext = async (id: number, key: string, value: string) => {
   return res.data;
 };
 
-export const getChatHistory = async (id: number, date?: string) => {
-  const url = date ? `${API_BASE}/servers/${id}/chat?date=${date}` : `${API_BASE}/servers/${id}/chat`;
+export const getChatHistory = async (serverId: number, chatSessionId: string, date?: string) => {
+  let url = `${API_BASE}/servers/${serverId}/chat?sessionId=${chatSessionId}`;
+  if (date) {
+    url += `&date=${date}`;
+  }
   const res = await axios.get(url);
   return res.data;
 };
 
-export const addChatMessage = async (id: number, role: 'user' | 'ai', message: string) => {
-  const res = await axios.post(`${API_BASE}/servers/${id}/chat`, { role, message });
+export const addChatMessage = async (serverId: number, chatSessionId: string, role: 'user' | 'ai', message: string) => {
+  if (role === 'ai') {
+    console.warn('Attempting to add AI message via addChatMessage. Prefer /api/ai for proper context logging.');
+  }
+  const res = await axios.post(`${API_BASE}/servers/${serverId}/chat`, { role, message, chatSessionId });
   return res.data;
 };
 
@@ -58,7 +64,12 @@ export const testServerConnection = async (id: number) => {
   return res.data;
 };
 
-export async function getChatSessions(serverId: number) {
-  const res = await axios.get(`${API_BASE}/servers/${serverId}/chat-sessions`);
-  return res.data;
-} 
+export const getChatSessions = async (serverId: number) => {
+  const response = await axios.get(`${API_BASE}/servers/${serverId}/chat-sessions`);
+  return response.data;
+};
+
+export const setChatSession = async (serverId: number, sessionId: string) => {
+  const response = await axios.post(`${API_BASE}/servers/${serverId}/set-chat-session`, { sessionId });
+  return response.data;
+}; 

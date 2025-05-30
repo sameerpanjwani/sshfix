@@ -19,9 +19,10 @@ interface TerminalProps {
   panelHeight?: number;
   onGeminiSuggestion?: (suggestion: any) => void;
   onHistoryUpdate?: (history: TerminalEntry[]) => void;
+  clearSignal?: number;
 }
 
-const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, onQuickCommandUsed, panelHeight = 400, onHistoryUpdate }) => {
+const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, onQuickCommandUsed, panelHeight = 400, onHistoryUpdate, clearSignal }) => {
   const xtermRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const historyRef = useRef<TerminalEntry[]>([]);
@@ -29,6 +30,13 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
   const lastQuickCommandRef = useRef<string | null>(null);
   const pendingCommandRef = useRef<string | null>(null);
   const wsReadyRef = useRef(false);
+  const lastForcedHistoryCommandRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (clearSignal && clearSignal > 0 && xtermRef.current) {
+      xtermRef.current.clear();
+    }
+  }, [clearSignal]);
 
   useEffect(() => {
     const term = new XTerm({
@@ -49,7 +57,16 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
       term.focus();
       // Add resize observer to fit terminal on container resize
       resizeObserver = new window.ResizeObserver(() => {
-        fitAddon.fit();
+        // Ensure the terminal instance and its core are still valid before fitting
+        if (xtermRef.current && xtermRef.current.core) {
+          try {
+            fitAddon.fit();
+          } catch (e) {
+            console.error("Error during fitAddon.fit() in ResizeObserver:", e);
+            // Optionally, disconnect the observer if errors persist
+            // resizeObserver?.disconnect(); 
+          }
+        }
       });
       resizeObserver.observe(containerRef.current);
     }
@@ -106,25 +123,48 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
         
         // Only log if we have a meaningful command
         if (cleanCommand && cleanCommand.length > 0) {
-          const entry = { 
+          const newEntry = { 
             command: cleanCommand, 
             output: outputBuffer.trim(), 
             created_at: new Date().toISOString() 
           };
+          console.log('[Terminal.tsx] Attempting to log new history entry:', JSON.stringify(newEntry));
           
-          historyRef.current = [...historyRef.current, entry];
-          if (typeof onHistoryUpdate === 'function') onHistoryUpdate(historyRef.current);
+          // Update local history ref for internal consistency if ever needed by Terminal.tsx itself,
+          // but ServerDetail.tsx will rely on freshHistory from the backend.
+          historyRef.current = [...historyRef.current, newEntry];
           
-          // Also send to backend to ensure it's persisted
-          try {
-            fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ command: cleanCommand, output: outputBuffer.trim() })
-            });
-          } catch (e) {
-            console.error('Failed to log command to backend:', e);
-          }
+          // Persist to backend, then fetch fresh history, then call onHistoryUpdate
+          fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ command: newEntry.command, output: newEntry.output })
+          })
+          .then(postResponse => {
+            if (!postResponse.ok) {
+              console.error('Failed to log command to backend:', postResponse.statusText);
+              throw new Error(`Backend POST failed: ${postResponse.statusText}`);
+            }
+            // If POST is OK, then fetch the complete, fresh history
+            return fetch(`http://localhost:4000/api/servers/${serverId}/history`);
+          })
+          .then(getResponse => {
+            if (!getResponse.ok) {
+              console.error('Failed to fetch fresh history from backend:', getResponse.statusText);
+              throw new Error(`Backend GET failed: ${getResponse.statusText}`);
+            }
+            return getResponse.json();
+          })
+          .then(freshHistory => {
+            console.log('[Terminal.tsx] Received freshHistory from backend GET:', JSON.stringify(freshHistory.slice(-3)));
+            if (typeof onHistoryUpdate === 'function') {
+              onHistoryUpdate(freshHistory);
+            }
+          })
+          .catch(error => {
+            console.error('Error in history logging/fetching pipeline:', error);
+            // Do not call onHistoryUpdate if backend interaction fails, to avoid stale suggestions.
+          });
         }
         
         commandBuffer = '';
@@ -165,6 +205,28 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
         wsRef.current.send(quickCommand + '\n');
         lastQuickCommandRef.current = quickCommand;
         if (typeof onQuickCommandUsed === 'function') onQuickCommandUsed();
+        // Immediately log the command to backend history with empty output
+        fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: quickCommand, output: '' })
+        }).catch(err => {
+          console.error('[Terminal.tsx] Error logging quick/templated command to history:', err);
+        });
+        // After a short delay, fetch history and update
+        setTimeout(() => {
+          fetch(`http://localhost:4000/api/servers/${serverId}/history`)
+            .then(res => res.json())
+            .then(freshHistory => {
+              if (typeof onHistoryUpdate === 'function') {
+                onHistoryUpdate(freshHistory);
+                lastForcedHistoryCommandRef.current = quickCommand;
+              }
+            })
+            .catch(err => {
+              console.error('[Terminal.tsx] Error fetching history after quick/templated command:', err);
+            });
+        }, 700);
       } else {
         // Queue the command to be sent when ws is ready
         pendingCommandRef.current = quickCommand;
