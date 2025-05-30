@@ -187,54 +187,62 @@ const ServerDetail: React.FC = () => {
   // Enhanced onHistoryUpdate: update history and fetch Gemini suggestion
   const handleHistoryUpdate = async (newHistory: any[]) => {
     setHistory(newHistory); // Store global history
+    
+    // Clear any existing timeout
     if (timeoutIdRef.current) {
       clearTimeout(timeoutIdRef.current);
     }
+    
+    // Set new timeout for debounced suggestion
     timeoutIdRef.current = setTimeout(async () => {
       try {
+        // Get current session ID
         const capturedSessionId = currentChatSessionIdRef.current;
-        const capturedAvailableSessions = availableChatSessionsRef.current;
         
+        // Skip if no session
         if (capturedSessionId === null) {
           console.log('[ServerDetail.tsx] No current session ID, skipping suggestions');
           return;
         }
         
-        const currentSession = capturedAvailableSessions.find(s => s.sessionId === capturedSessionId.toString());
-        
-        if (!currentSession) {
-          console.log('[ServerDetail.tsx] No current session found, skipping suggestions');
-          return;
-        }
-        
-        console.log(`[ServerDetail.tsx] Using session-based filtering for session ${capturedSessionId}`);
-        
-        const sessionIdStr = currentSession.sessionId?.toString();
+        // Get latest entries for this session
         const sessionHistory = newHistory.filter(e => 
-          e.chat_session_id?.toString() === sessionIdStr
-        );
-        const entriesForSuggestion = sessionHistory.slice(-6).reverse().map(e => ({
-          command: e.command || '',
-          output: (e.output || '').slice(0, 1000)
-        }));
-
-        if (entriesForSuggestion.length === 0) {
+          e.chat_session_id === capturedSessionId
+        ).slice(-6);
+        
+        // Skip if no entries
+        if (sessionHistory.length === 0) {
           console.log('[ServerDetail.tsx] No commands available for suggestions');
           return;
         }
-
-        const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
-        const latestCommand = newHistory.length > 0 ? (newHistory[newHistory.length - 1].command || '') : '';
+        
+        // Format entries for suggestion API
+        const entriesForSuggestion = sessionHistory.map(e => ({
+          command: e.command || '',
+          output: (e.output || '').slice(0, 1000)
+        }));
+        
+        // Get latest command
+        const latestCommand = sessionHistory[sessionHistory.length - 1]?.command || '';
+        
+        // Get base URL
+        const baseUrl = window.location.origin.includes('localhost') 
+          ? 'http://localhost:4000' 
+          : window.location.origin;
         
         console.log(`[ServerDetail.tsx] Sending suggestion request for session ${capturedSessionId}`);
+        console.log('[ServerDetail.tsx] Latest command:', latestCommand);
+        console.log('[ServerDetail.tsx] Entries:', entriesForSuggestion);
         
+        // Call suggestion API
         const response = await axios.post(baseUrl + '/api/ai/terminal-suggest', {
           entries: entriesForSuggestion,
-          latestCommand: latestCommand,
+          latestCommand,
           serverId: Number(id),
           sessionId: capturedSessionId
         });
         
+        // Update suggestions if we got a valid response
         if (response.data && (response.data.response || response.data.json)) {
           setGeminiSuggestions(prev => {
             const newSuggestions = [...prev, response.data].slice(-3); // Keep last 3
@@ -246,7 +254,7 @@ const ServerDetail: React.FC = () => {
       } catch (error) {
         console.error('[ServerDetail.tsx] Error fetching Gemini suggestion:', error);
       }
-    }, 300);
+    }, 1000); // Increased debounce to 1 second
   };
   
   if (loading || !server) return <div>Loading...</div>;
@@ -262,10 +270,31 @@ const ServerDetail: React.FC = () => {
         </div>
       </div>
       {/* Server Info */}
-      <div style={{ padding: '16px 32px', borderBottom: '1px solid #f0f0f0', background: '#f8fafc', display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+      <div style={{ padding: '16px 32px', borderBottom: '1px solid #f0f0f0', background: '#f8fafc', display: 'flex', gap: 32, flexWrap: 'wrap', alignItems: 'center' }}>
         <div><b>Host:</b> {server.host}</div>
         <div><b>Username:</b> {server.username}</div>
         <div><b>Port:</b> {server.port}</div>
+        <Link 
+          to={`/server/${id}/db`} 
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ 
+            marginLeft: 'auto', 
+            color: '#2563eb', 
+            textDecoration: 'none', 
+            background: '#e0e7ff', 
+            padding: '6px 12px', 
+            borderRadius: 6, 
+            fontSize: 14, 
+            fontWeight: 500,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6
+          }}
+        >
+          View DB Entries
+          <span style={{ fontSize: 12 }}>↗</span>
+        </Link>
       </div>
       {/* Main Area */}
       <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT, height: PANEL_HEIGHT }}>

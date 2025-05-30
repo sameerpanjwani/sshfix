@@ -19,97 +19,8 @@ app.use(express.json());
 // Initialize SQLite database
 const db = new Database(path.join(__dirname, 'sshfix.db'));
 
-// --- Simple Migration System ---
-console.log('[DB_MIGRATE] Initializing migration system...');
-
-// 1. Ensure schema_migrations table exists
-try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version TEXT PRIMARY KEY,
-      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-  // console.log('[DB_MIGRATE] schema_migrations table ensured.');
-} catch (e) {
-  console.error('[DB_MIGRATE] FATAL: Could not create schema_migrations table:', e.message);
-  process.exit(1); // Exit if we can't manage migrations
-}
-
-// 2. Define Migrations
-const migrations = [
-  {
-    version: 1,
-    name: 'add_ai_request_context_to_chat_history',
-    query: `ALTER TABLE chat_history ADD COLUMN ai_request_context TEXT NULL`
-  },
-  {
-    version: 2,
-    name: 'add_chat_session_id_to_chat_history',
-    query: `ALTER TABLE chat_history ADD COLUMN chat_session_id TEXT NOT NULL DEFAULT 'default_session_0'`
-  },
-  {
-    version: 3,
-    name: 'add_chat_session_id_to_history',
-    query: `ALTER TABLE history ADD COLUMN chat_session_id INTEGER NULL`
-  },
-  {
-    version: 4,
-    name: 'cleanup_legacy_string_session_ids',
-    query: `DELETE FROM chat_history WHERE chat_session_id NOT GLOB '[0-9]*' OR LENGTH(chat_session_id) < 10`
-  }
-];
-
-// Global variable to track current chat session ID per server
-const currentChatSessions = new Map(); // serverId -> sessionId
-
-// 3. Apply Pending Migrations
-try {
-  for (const migration of migrations) {
-    const isAppliedStmt = db.prepare('SELECT version FROM schema_migrations WHERE version = ?');
-    const isApplied = isAppliedStmt.get(migration.version.toString());
-  
-    if (!isApplied) {
-      console.log(`[DB_MIGRATE] Applying migration: ${migration.name}...`);
-      try {
-        db.transaction(() => {
-          try {
-            db.prepare(migration.query).run();
-          } catch (innerErr) {
-            // If ALTER TABLE fails due to duplicate column, it means it was applied manually or by an older version of this code.
-            if (innerErr.message.includes('duplicate column name')) {
-              console.warn(`[DB_MIGRATE] Warning during ${migration.name}: Column already exists. Assuming applied.`);
-            } else {
-              throw innerErr; // Re-throw other errors
-            }
-          }
-          // If statement ran (or was duplicate), record the migration
-          db.prepare('INSERT INTO schema_migrations (version) VALUES (?)').run(migration.version.toString());
-          console.log(`[DB_MIGRATE] Successfully applied and recorded migration: ${migration.name}`);
-        })();
-      } catch (err) {
-        console.error(`[DB_MIGRATE] Failed to apply migration ${migration.name}:`, err);
-        throw err;
-      }
-    } else {
-      console.log(`[DB_MIGRATE] Migration ${migration.name} already applied, skipping.`);
-    }
-  }
-  console.log('[DB_MIGRATE] All migrations checked.');
-} catch (err) {
-  console.error('[DB_MIGRATE] Migration failed:', err);
-  process.exit(1);
-}
-// --- End of Simple Migration System ---
-
-
-// Create tables if not exist
-// Servers table: id, name, host, port, username, password, privateKey, created_at
-// History table: id, server_id, command, output, created_at
-// Context table: id, server_id, key, value
-// Add chat_history table for per-server chat logs
-// chat_history: id, server_id, role, message, created_at
-
+// Create tables with all necessary columns
+console.log('[DB] Creating tables...');
 db.exec(`
 CREATE TABLE IF NOT EXISTS servers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,14 +32,17 @@ CREATE TABLE IF NOT EXISTS servers (
   privateKey TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
 CREATE TABLE IF NOT EXISTS history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   server_id INTEGER,
   command TEXT NOT NULL,
   output TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  chat_session_id INTEGER NULL,
   FOREIGN KEY(server_id) REFERENCES servers(id)
 );
+
 CREATE TABLE IF NOT EXISTS context (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   server_id INTEGER,
@@ -136,17 +50,21 @@ CREATE TABLE IF NOT EXISTS context (
   value TEXT,
   FOREIGN KEY(server_id) REFERENCES servers(id)
 );
+
 CREATE TABLE IF NOT EXISTS chat_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   server_id INTEGER,
-  role TEXT NOT NULL, -- 'user' or 'ai'
+  role TEXT NOT NULL,
   message TEXT NOT NULL,
-  chat_session_id TEXT NOT NULL,
+  chat_session_id TEXT NOT NULL DEFAULT 'default_session_0',
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  ai_request_context TEXT,
+  ai_request_context TEXT NULL,
   FOREIGN KEY(server_id) REFERENCES servers(id)
 );
 `);
+
+// Global variable to track current chat session ID per server
+const currentChatSessions = new Map(); // serverId -> sessionId
 
 // Multer setup for image uploads
 const uploadDir = path.join(__dirname, 'uploads');
@@ -200,27 +118,44 @@ app.get('/api/servers/:id/history', (req, res) => {
   res.json(history);
 });
 
-// API: Add history entry
+// API: Add terminal history
 app.post('/api/servers/:id/history', (req, res) => {
   const serverId = parseInt(req.params.id);
   const { command, output } = req.body;
-  const currentSessionId = currentChatSessions.get(serverId);
   
-  // If no session is set, use null (which is fine for the database)
-  const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
-  
+  if (!command) {
+    return res.status(400).json({ error: 'Command is required' });
+  }
+
   try {
-    const stmt = db.prepare(`
-      INSERT INTO history (server_id, command, output, chat_session_id, created_at) 
-      VALUES (?, ?, ?, ?, datetime('now'))
-    `);
-    const result = stmt.run(serverId, command, output, sessionIdToUse);
-    
-    console.log(`[HISTORY] Added command "${command}" to server ${serverId}, session ${sessionIdToUse}`);
-    res.json({ id: result.lastInsertRowid, success: true });
+    // Get current chat session ID for this server
+    const currentSession = db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+    const sessionId = currentSession?.chat_session_id || null;
+
+    console.log('[HISTORY] Added command', JSON.stringify(command), 'to server', serverId, 'session', sessionId);
+
+    // Insert with session ID
+    const stmt = db.prepare('INSERT INTO history (server_id, command, output, chat_session_id, created_at) VALUES (?, ?, ?, ?, ?)');
+    stmt.run(
+      serverId,
+      command,
+      output || '',
+      sessionId,
+      new Date().toISOString()
+    );
+
+    // Get updated history for this session
+    const history = db.prepare(`
+      SELECT * FROM history 
+      WHERE server_id = ? 
+      AND (chat_session_id = ? OR chat_session_id IS NULL)
+      ORDER BY created_at DESC
+    `).all(serverId, sessionId);
+
+    res.json(history);
   } catch (error) {
     console.error('Error adding history:', error);
-    res.status(500).json({ error: 'Failed to add history entry' });
+    res.status(500).json({ error: 'Failed to add history' });
   }
 });
 
@@ -857,6 +792,86 @@ app.post('/api/servers/:id/test', async (req, res) => {
   }
 });
 
+// Test New Server Connection Endpoint (before adding)
+app.post('/api/servers/test-connection', async (req, res) => {
+  const { host, port, username, password, privateKey } = req.body;
+  
+  const conn = new SSHClient();
+  let result = {
+    success: false,
+    error: null,
+    os: null,
+    tips: [],
+    raw: null
+  };
+  let timeout;
+  try {
+    conn.on('ready', () => {
+      // Try to detect OS
+      conn.exec('uname -a || ver', (err, stream) => {
+        if (err) {
+          result.success = true;
+          result.os = 'Unknown';
+          result.tips.push('Connected, but could not detect OS.');
+          conn.end();
+          clearTimeout(timeout);
+          return res.json(result);
+        }
+        let osOutput = '';
+        stream.on('data', (data) => {
+          osOutput += data.toString();
+        }).on('close', () => {
+          result.success = true;
+          result.os = osOutput.trim();
+          result.tips.push('SSH connection successful!');
+          if (/ubuntu|debian|centos|fedora|linux|unix/i.test(osOutput)) {
+            result.tips.push('Detected Linux/Unix server.');
+          } else if (/windows|microsoft/i.test(osOutput)) {
+            result.tips.push('Detected Windows server.');
+          } else {
+            result.tips.push('Could not confidently detect OS.');
+          }
+          conn.end();
+          clearTimeout(timeout);
+          return res.json(result);
+        });
+      });
+    }).on('error', (err) => {
+      result.error = err.message;
+      if (/timed out|timeout/i.test(err.message)) {
+        result.tips.push('Connection timed out. Check network/firewall and server IP/port.');
+      } else if (/auth|password|key/i.test(err.message)) {
+        result.tips.push('Authentication failed. Verify username, password, or private key.');
+      } else if (/ECONNREFUSED|refused/i.test(err.message)) {
+        result.tips.push('Connection refused. Is the SSH service running and accessible?');
+      } else {
+        result.tips.push('Check server address, port, credentials, and network connectivity.');
+      }
+      clearTimeout(timeout);
+      return res.json(result);
+    }).connect({
+      host,
+      port: port || 22,
+      username,
+      password: password || undefined,
+      privateKey: privateKey || undefined,
+      readyTimeout: 10000
+    });
+    // Manual timeout fallback
+    timeout = setTimeout(() => {
+      result.error = 'Connection timed out.';
+      result.tips.push('Check network/firewall and server IP/port.');
+      try { conn.end(); } catch {}
+      return res.json(result);
+    }, 12000);
+  } catch (err) {
+    result.error = err.message;
+    result.tips.push('Unexpected error. Check server details and try again.');
+    try { conn.end(); } catch {}
+    return res.json(result);
+  }
+});
+
 // AI Key Availability Endpoint
 app.get('/api/ai/available', (req, res) => {
   res.json({
@@ -940,42 +955,25 @@ Recent command history (most recent last):
     chronologicalEntries.forEach((entry, i) => {
       const cmd = entry.command || '';
       const out = entry.output || '';
-      prompt += `${i + 1}. Command: ${cmd}\n`;
+      prompt += `\n${i + 1}. Command: ${cmd}\n`;
       if (out.trim()) {
         // Look for common error patterns in the output
         const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
-        const outputPrefix = hasError ? 'Error Output:' : 'Output:';
-        // Increase truncation limit for error messages to ensure we capture the full error
+        const outputPrefix = hasError ? 'Error Output' : 'Output';
+        // Increase truncation limit for error messages
         const truncateLimit = hasError ? 2000 : 1000;
         const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
-        prompt += `   ${outputPrefix} ${truncatedOutput}\n`;
+        // Format output with proper indentation and line breaks
+        const lines = truncatedOutput.split('\n');
+        const formattedOutput = lines
+          .filter(line => line.trim()) // Remove empty lines
+          .map(line => `   ${line.trim()}`) // Indent each line
+          .join('\n');
+        prompt += `   ${outputPrefix}:\n${formattedOutput}\n`;
       }
-      prompt += '\n';
     });
 
-    prompt += `Based on this command history, what would be a logical next command? Focus especially on the most recent command: "${actualLatestCommand}"
-
-If you see any errors in the command outputs above, suggest commands that would help fix those errors or provide alternatives that would work better.
-
-Provide your response as a JSON object with:
-- "answer": A brief explanation of what the suggested command does, mentioning any errors seen and how to fix them
-- "commands": An array of 1-3 suggested commands (just the command strings)
-- "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
-  1. What the command does
-  2. Why it's relevant after the previous command (especially if fixing an error)
-  3. What output to expect
-  4. Any potential errors to watch out for
-
-Example response:
-{
-  "answer": "I noticed the previous command failed because 'ncdu' is not installed. Let's install it first, then try some alternative disk usage analysis commands.",
-  "commands": ["apt-get install ncdu -y", "du -sh /* 2>/dev/null | sort -h", "df -h"],
-  "explanations": [
-    "Installs the ncdu package using apt-get. The -y flag automatically answers yes to prompts. If this fails, you might need to use sudo or a different package manager like yum or brew depending on your system.",
-    "Lists disk usage for all top-level directories, sorted by size in human-readable format. The 2>/dev/null suppresses permission denied errors. This is a good alternative to ncdu that works on all Unix systems.",
-    "Shows overall disk space usage for all mounted filesystems in human-readable format. This helps identify which partitions are running low on space."
-  ]
-}`;
+    prompt += '\n\nBased on this command history, suggest the next logical command that would help the user.';
 
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
     if (!GEMINI_API_KEY) {
@@ -1319,10 +1317,18 @@ wss.on('connection', (ws, req) => {
   let shellStream = null;
   let commandBuffer = '';
   let outputBuffer = '';
-  let lastPrompt = '';
+  let currentCommand = '';
   let isShellReady = false;
+
   conn.on('ready', () => {
-    conn.shell({ term: 'xterm-color', cols: 80, rows: 24 }, (err, stream) => {
+    conn.shell({ 
+      term: 'xterm-color',
+      cols: 80,
+      rows: 24,
+      modes: {
+        ECHO: true        // Ensure terminal echo is on
+      }
+    }, (err, stream) => {
       if (err) {
         ws.send(`Shell error: ${err.message}`);
         ws.close();
@@ -1331,64 +1337,135 @@ wss.on('connection', (ws, req) => {
       }
       shellStream = stream;
       isShellReady = true;
+
+      // Handle data from shell
       stream.on('data', (data) => {
-        const text = data.toString('utf8');
-        ws.send(text);
-        outputBuffer += text;
-        // Detect command completion by prompt (simple heuristic: $ or # at line start)
-        const lines = outputBuffer.split(/\r?\n/);
-        const lastLine = lines[lines.length - 1];
-        if (/[$#] $/.test(lastLine)) {
-          // Command likely finished, log it
-          if (commandBuffer.trim()) {
-            const currentSessionId = currentChatSessions.get(Number(serverId));
-            // Validate session ID before using it
-            const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
+        try {
+          const text = data.toString('utf8');
+          ws.send(text);
+          outputBuffer += text;
+          
+          // Detect command completion by prompt
+          const lines = outputBuffer.split(/\r?\n/);
+          const lastLine = lines[lines.length - 1];
+          const promptPatterns = [
+            /[$#%>] ?$/,           // Common Unix/Linux prompts
+            />\s*$/,               // Windows prompt
+            /\]\$\s*$/,            // Bash with brackets
+            /\]#\s*$/,             // Root with brackets
+            /❯\s*$/,               // Modern shells (zsh, fish)
+            /➜\s*$/,               // Another modern prompt
+            /PS [^>]*>\s*$/        // Windows PowerShell prompt
+          ];
+          
+          const hasPrompt = promptPatterns.some(pattern => pattern.test(lastLine));
+          
+          if (hasPrompt && commandBuffer.trim()) {
+            const cleanCommand = commandBuffer.trim();
+            // Get everything except the last line (prompt)
+            const commandOutput = lines.slice(0, -1).join('\n').trim();
             
-            try {
-              db.prepare('INSERT INTO history (server_id, command, output, chat_session_id) VALUES (?, ?, ?, ?)')
-                .run(serverId, commandBuffer.trim(), outputBuffer, sessionIdToUse);
-              console.log(`[TERMINAL] Logged command with session ID: ${sessionIdToUse}`);
-            } catch (error) {
-              console.error('[TERMINAL] Failed to log command:', error);
+            if (cleanCommand && cleanCommand.length > 0) {
+              const currentSessionId = currentChatSessions.get(Number(serverId));
+              const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
+              
+              try {
+                db.prepare('INSERT INTO history (server_id, command, output, chat_session_id) VALUES (?, ?, ?, ?)')
+                  .run(serverId, cleanCommand, commandOutput, sessionIdToUse);
+                console.log(`[TERMINAL] Logged command "${cleanCommand}" with output length ${commandOutput.length}`);
+              } catch (error) {
+                console.error('[TERMINAL] Failed to log command:', error);
+              }
             }
             
+            // Reset buffers after logging
             commandBuffer = '';
             outputBuffer = '';
+            currentCommand = '';
           }
+        } catch (error) {
+          console.error('[TERMINAL] Error processing shell data:', error);
         }
       });
+
+      // Handle stderr separately
+      stream.stderr?.on('data', (data) => {
+        try {
+          const text = data.toString('utf8');
+          ws.send(text);
+          outputBuffer += text;
+        } catch (error) {
+          console.error('[TERMINAL] Error processing stderr:', error);
+        }
+      });
+
       stream.on('close', () => {
         ws.close();
         conn.end();
       });
-      stream.stderr?.on('data', (data) => {
-        ws.send(data.toString('utf8'));
-        outputBuffer += data.toString('utf8');
+
+      stream.on('error', (err) => {
+        console.error('[TERMINAL] Shell stream error:', err);
+        ws.send(`\r\n\x1b[31m[Shell Error: ${err.message}]\x1b[0m\r\n`);
       });
     });
   }).on('error', (err) => {
-    ws.send(`SSH error: ${err.message}`);
+    console.error('[TERMINAL] SSH connection error:', err);
+    ws.send(`\r\n\x1b[31m[SSH Error: ${err.message}]\x1b[0m\r\n`);
     ws.close();
-  }).connect({
-    host: serverRow.host,
-    port: serverRow.port,
-    username: serverRow.username,
-    password: serverRow.password || undefined,
-    privateKey: serverRow.privateKey || undefined,
   });
-  ws.on('message', (msg) => {
-    if (!isShellReady || !shellStream) return;
-    shellStream.write(msg);
-    // Buffer command for logging (simple: accumulate until Enter) 
-    if (typeof msg === 'string' && msg.endsWith('\n')) {
-      commandBuffer += msg;
-    } else if (typeof msg === 'string') {
-      commandBuffer += msg;
+
+  // Handle incoming data from client
+  ws.on('message', (data) => {
+    try {
+      if (!isShellReady || !shellStream) {
+        console.warn('[TERMINAL] Received data before shell ready');
+        return;
+      }
+      const text = data.toString('utf8');
+      shellStream.write(text);
+      commandBuffer += text;
+      
+      // If this is a newline, we're starting a new command
+      if (text === '\r' || text === '\n') {
+        const newCommand = commandBuffer.trim();
+        if (newCommand) {
+          currentCommand = newCommand;
+          outputBuffer = ''; // Reset output buffer for new command
+        }
+      }
+    } catch (error) {
+      console.error('[TERMINAL] Error processing client message:', error);
+      ws.send(`\r\n\x1b[31m[Internal Error: ${error.message}]\x1b[0m\r\n`);
     }
   });
+
+  // Handle WebSocket closure
   ws.on('close', () => {
-    if (shellStream) shellStream.end();
-    conn.end();
+    try {
+      if (shellStream) {
+        shellStream.end();
+        shellStream = null;
+      }
+      if (conn) {
+        conn.end();
+      }
+    } catch (error) {
+      console.error('[TERMINAL] Error during cleanup:', error);
+    }
   });
+
+  // Connect to the SSH server
+  try {
+    conn.connect({
+      host: serverRow.host,
+      port: serverRow.port || 22,
+      username: serverRow.username,
+      password: serverRow.password
+    });
+  } catch (error) {
+    console.error('[TERMINAL] Error initiating SSH connection:', error);
+    ws.send(`\r\n\x1b[31m[Connection Error: ${error.message}]\x1b[0m\r\n`);
+    ws.close();
+  }
 }); 

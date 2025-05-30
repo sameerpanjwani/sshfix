@@ -5,6 +5,11 @@ import { Terminal as XTerm } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 
+// Add API base URL constant at the top
+const API_BASE = window.location.origin.includes('localhost') 
+  ? 'http://localhost:4000/api'
+  : '/api';
+
 interface TerminalEntry {
   command: string;
   output: string;
@@ -32,6 +37,13 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
   const wsReadyRef = useRef(false);
   const lastForcedHistoryCommandRef = useRef<string | null>(null);
 
+  // Add click handler to ensure terminal focus
+  const handleContainerClick = () => {
+    if (xtermRef.current) {
+      xtermRef.current.focus();
+    }
+  };
+
   useEffect(() => {
     if (clearSignal && clearSignal > 0 && xtermRef.current) {
       xtermRef.current.clear();
@@ -45,7 +57,10 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
       fontSize: 15,
       theme: { background: '#181818', foreground: '#e0e0e0' },
       rows: 24,
-      cols: 80
+      cols: 80,
+      convertEol: true,
+      cursorStyle: 'block',
+      scrollback: 1000
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -55,186 +70,186 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
       term.open(containerRef.current);
       fitAddon.fit();
       term.focus();
-      // Add resize observer to fit terminal on container resize
       resizeObserver = new window.ResizeObserver(() => {
-        // Ensure the terminal instance and its core are still valid before fitting
         if (xtermRef.current && xtermRef.current.core) {
           try {
             fitAddon.fit();
+            term.focus();
           } catch (e) {
             console.error("Error during fitAddon.fit() in ResizeObserver:", e);
-            // Optionally, disconnect the observer if errors persist
-            // resizeObserver?.disconnect(); 
           }
         }
       });
       resizeObserver.observe(containerRef.current);
     }
-    // Show connecting message
+
     term.write('\x1b[33m[Connecting to SSH...]\x1b[0m\r\n');
+    
     // Fix WebSocket URL for dev/prod
     const wsUrl = import.meta.env.MODE === 'development'
       ? `ws://localhost:4000/ws/terminal?serverId=${serverId}`
       : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/terminal?serverId=${serverId}`;
+    
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
     wsReadyRef.current = false;
     let commandBuffer = '';
     let outputBuffer = '';
+    const outputMap = new Map<string, string>();
+    const currentCommand = { value: '' };
+
     ws.onopen = () => {
       wsReadyRef.current = true;
       term.write('\x1b[32m[Connected to SSH]\x1b[0m\r\n');
       term.scrollToBottom();
+      
       // If there is a pending quick command, send it now
       if (pendingCommandRef.current) {
-        term.write(pendingCommandRef.current + '\r');
-        ws.send(pendingCommandRef.current + '\n');
-        lastQuickCommandRef.current = pendingCommandRef.current;
+        const cmd = pendingCommandRef.current;
+        term.write(cmd);
+        term.write('\r\n');
+        ws.send(cmd + '\n');
+        lastQuickCommandRef.current = cmd;
         if (typeof onQuickCommandUsed === 'function') onQuickCommandUsed();
         pendingCommandRef.current = null;
       }
     };
+
     ws.onmessage = (event) => {
       const data = event.data;
       term.write(data);
-      term.scrollToBottom();
       outputBuffer += data;
       
-      // Improved heuristic: detect command completion
+      // Update output map for current command
+      if (currentCommand.value) {
+        outputMap.set(currentCommand.value, (outputMap.get(currentCommand.value) || '') + data);
+      }
+      
       const lines = outputBuffer.split(/\r?\n/);
       const lastLine = lines[lines.length - 1];
       
-      // Look for common shell prompts (more patterns)
       const promptPatterns = [
-        /[$#%>] ?$/,           // Common Unix/Linux prompts
-        />\s*$/,               // Windows prompt
-        /\]\$\s*$/,            // Bash with brackets
-        /\]#\s*$/,             // Root with brackets
-        /❯\s*$/,               // Modern shells (zsh, fish)
-        /➜\s*$/,               // Another modern prompt
+        /[$#%>] ?$/,
+        />\s*$/,
+        /\]\$\s*$/,
+        /\]#\s*$/,
+        /❯\s*$/,
+        /➜\s*$/,
+        /PS [^>]*>\s*$/,  // Windows PowerShell prompt
+        /^[A-Z]:\\.*>\s*$/  // Windows cmd.exe prompt
       ];
       
       const hasPrompt = promptPatterns.some(pattern => pattern.test(lastLine));
       
-      // Also check if output has been idle for a bit (backup detection)
       if (hasPrompt && commandBuffer.trim()) {
-        // Clean up the command (remove trailing newlines/returns)
         const cleanCommand = commandBuffer.trim().replace(/[\r\n]+$/, '');
         
-        // Only log if we have a meaningful command
         if (cleanCommand && cleanCommand.length > 0) {
+          const commandOutput = outputMap.get(cleanCommand) || outputBuffer;
+          
+          // Create new history entry
           const newEntry = { 
             command: cleanCommand, 
-            output: outputBuffer.trim(), 
+            output: commandOutput, 
             created_at: new Date().toISOString() 
           };
-          console.log('[Terminal.tsx] Attempting to log new history entry:', JSON.stringify(newEntry));
           
-          // Update local history ref for internal consistency if ever needed by Terminal.tsx itself,
-          // but ServerDetail.tsx will rely on freshHistory from the backend.
           historyRef.current = [...historyRef.current, newEntry];
           
-          // Persist to backend, then fetch fresh history, then call onHistoryUpdate
-          fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: newEntry.command, output: newEntry.output })
-          })
-          .then(postResponse => {
-            if (!postResponse.ok) {
-              console.error('Failed to log command to backend:', postResponse.statusText);
-              throw new Error(`Backend POST failed: ${postResponse.statusText}`);
-            }
-            // If POST is OK, then fetch the complete, fresh history
-            return fetch(`http://localhost:4000/api/servers/${serverId}/history`);
-          })
-          .then(getResponse => {
-            if (!getResponse.ok) {
-              console.error('Failed to fetch fresh history from backend:', getResponse.statusText);
-              throw new Error(`Backend GET failed: ${getResponse.statusText}`);
-            }
-            return getResponse.json();
-          })
-          .then(freshHistory => {
-            console.log('[Terminal.tsx] Received freshHistory from backend GET:', JSON.stringify(freshHistory.slice(-3)));
-            if (typeof onHistoryUpdate === 'function') {
-              onHistoryUpdate(freshHistory);
-            }
-          })
-          .catch(error => {
-            console.error('Error in history logging/fetching pipeline:', error);
-            // Do not call onHistoryUpdate if backend interaction fails, to avoid stale suggestions.
-          });
+          // Log command to backend
+          axios.post(`${API_BASE}/servers/${serverId}/history`, newEntry)
+            .then(() => axios.get(`${API_BASE}/servers/${serverId}/history`))
+            .then(response => {
+              if (typeof onHistoryUpdate === 'function') {
+                onHistoryUpdate(response.data);
+              }
+            })
+            .catch(error => {
+              console.error('Error in history logging/fetching pipeline:', error);
+            });
+          
+          // Clear command from output map
+          outputMap.delete(cleanCommand);
         }
         
+        // Reset buffers
         commandBuffer = '';
         outputBuffer = '';
+        currentCommand.value = '';
       }
     };
+
     ws.onclose = () => {
       wsReadyRef.current = false;
       term.write('\r\n\x1b[31m[Disconnected]\x1b[0m\r\n');
-      term.scrollToBottom();
     };
-    // Send user input to backend only if WebSocket is open
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      term.write('\r\n\x1b[31m[WebSocket Error]\x1b[0m\r\n');
+    };
+
     term.onData((data) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(data);
         commandBuffer += data;
+        
+        if (data === '\r' || data === '\n') {
+          const newCommand = commandBuffer.trim();
+          if (newCommand) {
+            currentCommand.value = newCommand;
+            outputMap.set(newCommand, '');
+          }
+        }
+      } else {
+        console.warn('WebSocket not ready, command not sent:', data);
       }
     });
+
     return () => {
-      ws.close();
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
       term.dispose();
-      // Clean up resize observer
       if (resizeObserver && containerRef.current) {
         resizeObserver.disconnect();
       }
     };
-  }, [serverId]); // Only re-run when serverId changes
+  }, [serverId]);
 
-  // Handle quickCommand from parent (e.g., chat quick actions)
+  // Handle quickCommand from parent
   useEffect(() => {
-    if (
-      quickCommand &&
-      quickCommand !== lastQuickCommandRef.current
-    ) {
-      if (wsRef.current && wsReadyRef.current && wsRef.current.readyState === WebSocket.OPEN && xtermRef.current) {
-        // Write the command to the terminal and send to backend
-        xtermRef.current.write(quickCommand + '\r');
-        wsRef.current.send(quickCommand + '\n');
+    if (quickCommand && quickCommand !== lastQuickCommandRef.current) {
+      if (wsRef.current?.readyState === WebSocket.OPEN && xtermRef.current) {
+        const cmd = quickCommand + '\n';
+        xtermRef.current.write(cmd);
+        wsRef.current.send(cmd);
         lastQuickCommandRef.current = quickCommand;
         if (typeof onQuickCommandUsed === 'function') onQuickCommandUsed();
-        // Immediately log the command to backend history with empty output
-        fetch(`http://localhost:4000/api/servers/${serverId}/history`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ command: quickCommand, output: '' })
+        
+        // Log command immediately
+        axios.post(`${API_BASE}/servers/${serverId}/history`, { 
+          command: quickCommand, 
+          output: '' 
         }).catch(err => {
-          console.error('[Terminal.tsx] Error logging quick/templated command to history:', err);
+          console.error('[Terminal.tsx] Error logging quick command:', err);
         });
-        // After a short delay, fetch history and update
-        setTimeout(() => {
-          fetch(`http://localhost:4000/api/servers/${serverId}/history`)
-            .then(res => res.json())
-            .then(freshHistory => {
-              if (typeof onHistoryUpdate === 'function') {
-                onHistoryUpdate(freshHistory);
-                lastForcedHistoryCommandRef.current = quickCommand;
-              }
-            })
-            .catch(err => {
-              console.error('[Terminal.tsx] Error fetching history after quick/templated command:', err);
-            });
-        }, 700);
       } else {
-        // Queue the command to be sent when ws is ready
         pendingCommandRef.current = quickCommand;
       }
     }
-  }, [quickCommand, onQuickCommandUsed]);
+  }, [quickCommand, serverId]);
 
-  return <div ref={containerRef} id="xterm-container" style={{ width: '100%', height: '100%', background: '#181818', borderRadius: 12, overflow: 'hidden', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }} />;
+  return (
+    <div 
+      ref={containerRef} 
+      id="xterm-container" 
+      style={{ width: '100%', height: '100%', background: '#181818', borderRadius: 12, overflow: 'hidden' }}
+      onClick={handleContainerClick}
+      onFocus={() => xtermRef.current?.focus()}
+      tabIndex={-1}
+    />
+  );
 };
 
 export default InteractiveTerminal; 

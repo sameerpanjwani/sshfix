@@ -1,6 +1,9 @@
 import axios from 'axios';
 
-const API_BASE = 'http://localhost:4000/api';
+// Fix API base URL to handle both dev and prod environments
+const API_BASE = window.location.origin.includes('localhost') 
+  ? 'http://localhost:4000/api'
+  : '/api';
 
 export const getServers = async () => {
   const res = await axios.get(`${API_BASE}/servers`);
@@ -72,4 +75,9 @@ export const getChatSessions = async (serverId: number) => {
 export const setChatSession = async (serverId: number, sessionId: string) => {
   const response = await axios.post(`${API_BASE}/servers/${serverId}/set-chat-session`, { sessionId });
   return response.data;
+};
+
+export const testNewServerConnection = async (server: any) => {
+  const res = await axios.post(`${API_BASE}/servers/test-connection`, server);
+  return res.data;
 }; 

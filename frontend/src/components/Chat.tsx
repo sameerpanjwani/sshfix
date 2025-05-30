@@ -3,6 +3,8 @@ import { useParams } from 'react-router-dom';
 import { getAISuggestion, getAIAvailability, uploadImages, editAISuggestion } from '../api/ai';
 import { getChatHistory, addChatMessage, getChatSessions } from '../api/servers';
 import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 
 // Define ChatMessage interface including ai_request_context
 interface ChatMessage {
@@ -414,6 +416,58 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     setLoading(false);
   };
 
+  // Add formatContextForDisplay function
+  const formatContextForDisplay = (context: string): string => {
+    try {
+      // First try to parse as JSON
+      const parsed = JSON.parse(context);
+      
+      // If it's an array of messages (AI context)
+      if (Array.isArray(parsed)) {
+        return parsed.map(msg => {
+          if (msg.role === 'system') {
+            return `System:\n${msg.content}\n`;
+          } else if (msg.role === 'user') {
+            return `User:\n${msg.content}\n`;
+          } else if (msg.role === 'ai' || msg.role === 'assistant') {
+            return `AI:\n${msg.content}\n`;
+          }
+          return `${msg.role}:\n${msg.content}\n`;
+        }).join('\n');
+      }
+      
+      // If it's a Gemini prompt object
+      if (parsed.contents) {
+        return parsed.contents.map((content: any) => {
+          const text = content.parts?.map((part: any) => part.text).filter(Boolean).join('\n') || '';
+          return `${content.role === 'model' ? 'AI' : 'User'}:\n${text}\n`;
+        }).join('\n');
+      }
+      
+      // If it's some other JSON structure, pretty print it
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      // If not JSON, try to format as terminal history
+      const lines = context.split('\n');
+      let formattedContext = '';
+      let currentCommand = '';
+      
+      for (const line of lines) {
+        if (line.startsWith('$ ')) {
+          if (currentCommand) formattedContext += '\n';
+          currentCommand = line.substring(2);
+          formattedContext += `Command: ${currentCommand}\n`;
+        } else if (line.includes('Output:') || line.includes('Error Output:')) {
+          formattedContext += line + '\n';
+        } else if (line.trim()) {
+          formattedContext += '  ' + line + '\n';
+        }
+      }
+      
+      return formattedContext || context;
+    }
+  };
+
   return (
     <div
       style={{ background: '#f5f7fa', borderRadius: 12, padding: 16, minHeight: 320, boxShadow: '0 2px 8px #0001', display: 'flex', flexDirection: 'column', height: '100%' }}
@@ -462,15 +516,12 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
                         style={{ cursor: 'pointer', color: '#6366f1', marginLeft: 8, fontSize: 18 }}
                         title="View full context sent to Gemini"
                         onClick={() => {
-                          try {
-                            setContextToShow(JSON.stringify(JSON.parse(s.prompt), null, 2));
-                          } catch {
-                            setContextToShow(s.prompt);
-                          }
+                          const formattedContext = formatContextForDisplay(s.prompt);
+                          setContextToShow(formattedContext);
                           setShowContextModal(true);
                         }}
                       >
-                        <b>i</b>
+                        i
                       </span>
                     )}
                   </div>
@@ -739,27 +790,68 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           </div>
         </div>
       )}
-      {/* AI Request Context Modal */}
+      {/* Context Modal */}
       {showContextModal && contextToShow && (
         <div style={{
-          position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', 
-          backgroundColor: 'rgba(0,0,0,0.5)', display: 'flex', 
-          alignItems: 'center', justifyContent: 'center', zIndex: 1001
-        }} onClick={() => setShowContextModal(false)}>
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1000
+        }}>
           <div style={{
-            background: 'white', padding: '20px', borderRadius: '8px', 
-            maxHeight: '80vh', overflowY: 'auto', minWidth: '300px', maxWidth: '70vw',
-            boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
-          }} onClick={e => e.stopPropagation()} /* Prevent modal from closing when clicking inside */ >
-            <h3 style={{ marginTop: 0, borderBottom: '1px solid #eee', paddingBottom: 10, marginBottom: 15 }}>AI Prompt Context</h3>
-            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: '#f5f5f5', padding: 15, borderRadius: 4 }}>
-              {contextToShow}
-            </pre>
-            <button onClick={() => setShowContextModal(false)} style={{
-              marginTop: '20px', padding: '10px 20px', borderRadius: '4px', 
-              border: 'none', background: '#007bff', color: 'white', cursor: 'pointer'
+            backgroundColor: 'white',
+            padding: '24px',
+            borderRadius: '12px',
+            maxWidth: '90%',
+            maxHeight: '90%',
+            overflow: 'auto',
+            position: 'relative',
+            width: '800px',
+            boxShadow: '0 4px 24px rgba(0, 0, 0, 0.15)'
+          }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#2563eb', paddingRight: '24px' }}>AI Context</h3>
+            <div style={{
+              whiteSpace: 'pre-wrap',
+              fontFamily: 'monospace',
+              fontSize: '14px',
+              lineHeight: '1.5',
+              backgroundColor: '#f8fafc',
+              padding: '16px',
+              borderRadius: '8px',
+              border: '1px solid #e2e8f0',
+              color: '#1e293b'
             }}>
-              Close
+              {formatContextForDisplay(contextToShow)}
+            </div>
+            <button
+              onClick={() => setShowContextModal(false)}
+              style={{
+                position: 'absolute',
+                right: '16px',
+                top: '16px',
+                border: 'none',
+                background: 'none',
+                fontSize: '24px',
+                cursor: 'pointer',
+                color: '#64748b',
+                width: '32px',
+                height: '32px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderRadius: '6px',
+                transition: 'background-color 0.2s'
+              }}
+              onMouseOver={e => (e.currentTarget.style.backgroundColor = '#f1f5f9')}
+              onMouseOut={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+            >
+              ×
             </button>
           </div>
         </div>
