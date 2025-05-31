@@ -6,7 +6,7 @@ class ServerRepository {
     this.db = new Database(path.join(__dirname, '../../sshfix.db'));
   }
 
-  async getSessionHistory(serverId, sessionId) {
+  getSessionHistory(serverId, sessionId) {
     try {
       // Get unique commands by using GROUP BY and taking the most recent output for each command
       return this.db.prepare(`
@@ -31,7 +31,7 @@ class ServerRepository {
     }
   }
 
-  async getServer(serverId) {
+  getServer(serverId) {
     try {
       return this.db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
     } catch (error) {
@@ -40,8 +40,24 @@ class ServerRepository {
     }
   }
 
-  async addServer(name, host, port, username, password, privateKey) {
+  checkServerExists(host, username) {
     try {
+      const server = this.db.prepare('SELECT * FROM servers WHERE host = ? AND username = ?').get(host, username);
+      return !!server;
+    } catch (error) {
+      console.error('[ServerRepository] Error checking server existence:', error);
+      throw error;
+    }
+  }
+
+  addServer(name, host, port, username, password, privateKey) {
+    try {
+      // Check if server with same host and username already exists
+      const exists = this.checkServerExists(host, username);
+      if (exists) {
+        throw new Error('Server with this host and username already exists');
+      }
+
       const stmt = this.db.prepare('INSERT INTO servers (name, host, port, username, password, privateKey) VALUES (?, ?, ?, ?, ?, ?)');
       const info = stmt.run(name, host, port || 22, username, password, privateKey);
       return info.lastInsertRowid;
@@ -51,7 +67,7 @@ class ServerRepository {
     }
   }
 
-  async deleteServer(serverId) {
+  deleteServer(serverId) {
     try {
       this.db.prepare('DELETE FROM servers WHERE id = ?').run(serverId);
       return true;
@@ -61,7 +77,7 @@ class ServerRepository {
     }
   }
 
-  async listServers() {
+  listServers() {
     try {
       return this.db.prepare('SELECT * FROM servers').all();
     } catch (error) {
@@ -70,7 +86,7 @@ class ServerRepository {
     }
   }
 
-  async addHistory(serverId, command, output, chatSessionId = null) {
+  addHistory(serverId, command, output, chatSessionId = null) {
     try {
       const stmt = this.db.prepare('INSERT INTO history (server_id, command, output, chat_session_id) VALUES (?, ?, ?, ?)');
       const info = stmt.run(serverId, command, output, chatSessionId);
@@ -81,7 +97,7 @@ class ServerRepository {
     }
   }
 
-  async getHistory(serverId) {
+  getHistory(serverId) {
     try {
       return this.db.prepare('SELECT id, server_id, command, output, created_at, chat_session_id FROM history WHERE server_id = ? ORDER BY created_at DESC').all(serverId);
     } catch (error) {
@@ -91,21 +107,41 @@ class ServerRepository {
   }
 
   getServerHistory(serverId) {
-    return this.db.prepare('SELECT id, server_id, command, output, created_at, chat_session_id FROM history WHERE server_id = ? ORDER BY created_at DESC').all(serverId);
+    try {
+      return this.db.prepare('SELECT id, server_id, command, output, created_at, chat_session_id FROM history WHERE server_id = ? ORDER BY created_at DESC').all(serverId);
+    } catch (error) {
+      console.error('[ServerRepository] Error getting server history:', error);
+      throw error;
+    }
   }
 
   getServerContext(serverId) {
-    return this.db.prepare('SELECT key, value FROM context WHERE server_id = ?').all(serverId);
+    try {
+      return this.db.prepare('SELECT key, value FROM context WHERE server_id = ?').all(serverId);
+    } catch (error) {
+      console.error('[ServerRepository] Error getting server context:', error);
+      throw error;
+    }
   }
 
   setServerContext(serverId, key, value) {
-    this.db.prepare('INSERT INTO context (server_id, key, value) VALUES (?, ?, ?) ON CONFLICT(server_id, key) DO UPDATE SET value = excluded.value')
-      .run(serverId, key, value);
-    return { success: true };
+    try {
+      this.db.prepare('INSERT INTO context (server_id, key, value) VALUES (?, ?, ?) ON CONFLICT(server_id, key) DO UPDATE SET value = excluded.value')
+        .run(serverId, key, value);
+      return { success: true };
+    } catch (error) {
+      console.error('[ServerRepository] Error setting server context:', error);
+      throw error;
+    }
   }
 
   getCurrentSession(serverId) {
-    return this.db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+    try {
+      return this.db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+    } catch (error) {
+      console.error('[ServerRepository] Error getting current session:', error);
+      throw error;
+    }
   }
 }
 

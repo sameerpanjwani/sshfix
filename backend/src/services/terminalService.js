@@ -3,6 +3,11 @@ const { Client: SSHClient } = require('ssh2');
 const serverRepository = require('../repositories/serverRepository');
 
 class TerminalService {
+  constructor() {
+    // Global variable to track current chat session ID per server
+    this.currentChatSessions = new Map(); // serverId -> sessionId
+  }
+
   setupWebSocketServer(server) {
     const wss = new WebSocket.Server({ server, path: '/ws/terminal' });
     
@@ -21,7 +26,7 @@ class TerminalService {
       return;
     }
 
-    const serverRow = serverRepository.getServerById(serverId);
+    const serverRow = serverRepository.getServer(serverId);
     if (!serverRow) {
       ws.close(1008, 'Server not found');
       return;
@@ -40,7 +45,7 @@ class TerminalService {
         cols: 80,
         rows: 24,
         modes: {
-          ECHO: true
+          ECHO: true        // Ensure terminal echo is on
         }
       }, (err, stream) => {
         if (err) {
@@ -49,7 +54,6 @@ class TerminalService {
           conn.end();
           return;
         }
-
         shellStream = stream;
         isShellReady = true;
 
@@ -81,8 +85,11 @@ class TerminalService {
               const commandOutput = lines.slice(0, -1).join('\n').trim();
               
               if (cleanCommand && cleanCommand.length > 0) {
+                const currentSessionId = this.currentChatSessions.get(Number(serverId));
+                const sessionIdToUse = currentSessionId !== undefined && !isNaN(currentSessionId) ? currentSessionId : null;
+                
                 try {
-                  serverRepository.addHistory(serverId, cleanCommand, commandOutput);
+                  serverRepository.addHistory(serverId, cleanCommand, commandOutput, sessionIdToUse);
                   console.log(`[TERMINAL] Logged command "${cleanCommand}" with output length ${commandOutput.length}`);
                 } catch (error) {
                   console.error('[TERMINAL] Failed to log command:', error);
@@ -173,8 +180,7 @@ class TerminalService {
         host: serverRow.host,
         port: serverRow.port || 22,
         username: serverRow.username,
-        password: serverRow.password || undefined,
-        privateKey: serverRow.privateKey || undefined,
+        password: serverRow.password
       });
     } catch (error) {
       console.error('[TERMINAL] Error initiating SSH connection:', error);

@@ -69,7 +69,7 @@ router.post('/ai', async (req, res) => {
 });
 
 // Get available AI models
-router.get('/ai/available', async (req, res) => {
+router.get('/available', async (req, res) => {
   const models = await aiService.getAvailableModels();
   res.json(models);
 });

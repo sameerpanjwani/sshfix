@@ -3,7 +3,7 @@ const serverRepository = require('../repositories/serverRepository');
 
 class SSHService {
   async executeCommand(serverId, command) {
-    const server = serverRepository.getServerById(serverId);
+    const server = serverRepository.getServer(serverId);
     if (!server) throw new Error('Server not found');
 
     return new Promise((resolve, reject) => {
@@ -41,7 +41,7 @@ class SSHService {
   }
 
   async testConnection(serverId) {
-    const server = serverRepository.getServerById(serverId);
+    const server = serverRepository.getServer(serverId);
     if (!server) throw new Error('Server not found');
 
     return new Promise((resolve, reject) => {
@@ -118,6 +118,24 @@ class SSHService {
   }
 
   async testNewConnection({ host, port, username, password, privateKey }) {
+    // Check if a server with the same host and username already exists
+    try {
+      const exists = serverRepository.checkServerExists(host, username);
+      if (exists) {
+        return {
+          success: false,
+          error: `A server with host ${host} and username ${username} already exists. Delete the existing server if you wish to update it.`,
+          tips: [
+            'Each server must have a unique host and username combination.',
+            'Check your existing servers to avoid duplicates.',
+            'Delete the existing server first if you wish to recreate it with new settings.'
+          ]
+        };
+      }
+    } catch (error) {
+      console.error('[SSHService] Error checking server existence:', error);
+    }
+
     return new Promise((resolve, reject) => {
       const conn = new SSHClient();
       let result = {

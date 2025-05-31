@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getServers } from '../api/servers';
+import { getServers, deleteServer } from '../api/servers';
 import { Link } from 'react-router-dom';
 
 interface Server {
@@ -13,13 +13,38 @@ interface Server {
 const ServerList: React.FC = () => {
   const [servers, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
 
-  useEffect(() => {
+  const loadServers = () => {
     getServers().then(data => {
       setServers(data);
       setLoading(false);
     });
+  };
+
+  useEffect(() => {
+    loadServers();
   }, []);
+
+  const handleDeleteClick = (serverId: number) => {
+    setDeleteConfirmId(serverId);
+  };
+
+  const handleDeleteConfirm = async (serverId: number) => {
+    try {
+      await deleteServer(serverId);
+      // Refresh server list
+      loadServers();
+      setDeleteConfirmId(null);
+    } catch (error) {
+      console.error('Error deleting server:', error);
+      alert('Failed to delete server. Please try again.');
+    }
+  };
+
+  const handleDeleteCancel = () => {
+    setDeleteConfirmId(null);
+  };
 
   if (loading) {
     return (
@@ -77,14 +102,29 @@ const ServerList: React.FC = () => {
                   </svg>
                   Terminal
                 </Link>
-                <Link to={`/server/${server.id}/chat`} className="btn btn-secondary">
+                <button 
+                  onClick={() => handleDeleteClick(server.id)} 
+                  className="btn btn-danger"
+                >
                   <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    <line x1="10" y1="11" x2="10" y2="17"></line>
+                    <line x1="14" y1="11" x2="14" y2="17"></line>
                   </svg>
-                  Chat
-                </Link>
+                  Delete
+                </button>
               </div>
             </div>
+            {deleteConfirmId === server.id && (
+              <div className="mt-4 p-3 border border-danger rounded bg-danger-light">
+                <p className="mb-2">Are you sure you want to delete this server? This action cannot be undone.</p>
+                <div className="flex gap-2 justify-end">
+                  <button onClick={handleDeleteCancel} className="btn btn-secondary">Cancel</button>
+                  <button onClick={() => handleDeleteConfirm(server.id)} className="btn btn-danger">Confirm Delete</button>
+                </div>
+              </div>
+            )}
           </div>
         ))}
       </div>

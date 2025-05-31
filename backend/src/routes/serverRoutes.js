@@ -5,34 +5,65 @@ const sshService = require('../services/sshService');
 
 // List servers
 router.get('/', (req, res) => {
-  const servers = serverRepository.getAllServers();
-  res.json(servers);
+  try {
+    const servers = serverRepository.listServers();
+    res.json(servers);
+  } catch (error) {
+    console.error('Error listing servers:', error);
+    res.status(500).json({ error: 'Failed to list servers: ' + error.message });
+  }
 });
 
 // Add server
 router.post('/', (req, res) => {
-  const { name, host, port, username, password, privateKey } = req.body;
-  const result = serverRepository.createServer({ name, host, port, username, password, privateKey });
-  res.json(result);
+  try {
+    const { name, host, port, username, password, privateKey } = req.body;
+    
+    // Validate required fields
+    if (!name || !host || !username) {
+      return res.status(400).json({ error: 'Name, host, and username are required' });
+    }
+
+    const serverId = serverRepository.addServer(name, host, port, username, password, privateKey);
+    res.json({ id: serverId });
+  } catch (error) {
+    console.error('Error adding server:', error);
+    res.status(500).json({ error: 'Failed to add server: ' + error.message });
+  }
 });
 
 // Get server by id
 router.get('/:id', (req, res) => {
-  const server = serverRepository.getServerById(req.params.id);
-  if (!server) return res.status(404).json({ error: 'Not found' });
-  res.json(server);
+  try {
+    const server = serverRepository.getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'Server not found' });
+    res.json(server);
+  } catch (error) {
+    console.error('Error getting server:', error);
+    res.status(500).json({ error: 'Failed to get server: ' + error.message });
+  }
 });
 
 // Delete server
 router.delete('/:id', (req, res) => {
-  const result = serverRepository.deleteServer(req.params.id);
-  res.json(result);
+  try {
+    const result = serverRepository.deleteServer(req.params.id);
+    res.json({ success: result });
+  } catch (error) {
+    console.error('Error deleting server:', error);
+    res.status(500).json({ error: 'Failed to delete server: ' + error.message });
+  }
 });
 
 // List history for a server
 router.get('/:id/history', (req, res) => {
-  const history = serverRepository.getServerHistory(req.params.id);
-  res.json(history);
+  try {
+    const history = serverRepository.getServerHistory(req.params.id);
+    res.json(history);
+  } catch (error) {
+    console.error('Error getting server history:', error);
+    res.status(500).json({ error: 'Failed to get server history: ' + error.message });
+  }
 });
 
 // Add terminal history
@@ -62,24 +93,41 @@ router.post('/:id/history', (req, res) => {
 
 // Get context for a server
 router.get('/:id/context', (req, res) => {
-  const context = serverRepository.getServerContext(req.params.id);
-  res.json(context);
+  try {
+    const context = serverRepository.getServerContext(req.params.id);
+    res.json(context);
+  } catch (error) {
+    console.error('Error getting server context:', error);
+    res.status(500).json({ error: 'Failed to get server context: ' + error.message });
+  }
 });
 
 // Set context key/value
 router.post('/:id/context', (req, res) => {
-  const { key, value } = req.body;
-  const result = serverRepository.setServerContext(req.params.id, key, value);
-  res.json(result);
+  try {
+    const { key, value } = req.body;
+    if (!key) {
+      return res.status(400).json({ error: 'Key is required' });
+    }
+    const result = serverRepository.setServerContext(req.params.id, key, value);
+    res.json(result);
+  } catch (error) {
+    console.error('Error setting server context:', error);
+    res.status(500).json({ error: 'Failed to set server context: ' + error.message });
+  }
 });
 
 // SSH Command Execution
 router.post('/:id/ssh', async (req, res) => {
   try {
     const { command } = req.body;
+    if (!command) {
+      return res.status(400).json({ error: 'Command is required' });
+    }
     const result = await sshService.executeCommand(req.params.id, command);
     res.json(result);
   } catch (error) {
+    console.error('Error executing SSH command:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -90,6 +138,7 @@ router.post('/:id/test', async (req, res) => {
     const result = await sshService.testConnection(req.params.id);
     res.json(result);
   } catch (error) {
+    console.error('Error testing SSH connection:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -98,10 +147,87 @@ router.post('/:id/test', async (req, res) => {
 router.post('/test-connection', async (req, res) => {
   try {
     const { host, port, username, password, privateKey } = req.body;
+    
+    // Validate required fields
+    if (!host || !username) {
+      return res.status(400).json({ error: 'Host and username are required' });
+    }
+    
     const result = await sshService.testNewConnection({ host, port, username, password, privateKey });
     res.json(result);
   } catch (error) {
+    console.error('Error testing new connection:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// List chat sessions for a server
+router.get('/:id/chat-sessions', (req, res) => {
+  const serverId = parseInt(req.params.id);
+  try {
+    const sessions = serverRepository.db.prepare(`
+      SELECT DISTINCT 
+        chat_session_id as sessionId,
+        MIN(created_at) as startTime,
+        COUNT(*) as messageCount,
+        (SELECT message FROM chat_history ch2 
+         WHERE ch2.server_id = chat_history.server_id 
+         AND ch2.chat_session_id = chat_history.chat_session_id 
+         AND ch2.role = 'user' 
+         ORDER BY ch2.created_at ASC LIMIT 1) as firstMessage,
+        'Session ' || chat_session_id as label
+      FROM chat_history 
+      WHERE server_id = ? 
+      GROUP BY chat_session_id 
+      ORDER BY MIN(created_at) DESC
+    `).all(serverId);
+    
+    // Format the sessions for frontend display
+    const formattedSessions = sessions.map(s => ({
+      ...s,
+      startTime: new Date(s.startTime).toISOString(),
+      messageCount: parseInt(s.messageCount),
+      firstMessage: s.firstMessage || 'No messages'
+    }));
+    
+    res.json(formattedSessions);
+  } catch (error) {
+    console.error('Error fetching chat sessions:', error);
+    res.status(500).json({ error: 'Failed to fetch chat sessions' });
+  }
+});
+
+// Update chat session tracking
+router.post('/:id/set-chat-session', (req, res) => {
+  const serverId = parseInt(req.params.id);
+  const { sessionId } = req.body;
+  
+  console.log(`[CHAT SESSION] Received sessionId: "${sessionId}" for server ${serverId}`);
+  
+  // Extract numeric session ID from string (e.g., "server-1-session-123" -> 123)
+  if (!sessionId || typeof sessionId !== 'string') {
+    console.error(`[CHAT SESSION] Invalid sessionId: ${sessionId}`);
+    return res.status(400).json({ error: 'Valid sessionId is required' });
+  }
+  
+  const parts = sessionId.split('-');
+  const lastPart = parts[parts.length - 1];
+  const numericSessionId = parseInt(lastPart);
+  
+  if (isNaN(numericSessionId)) {
+    console.error(`[CHAT SESSION] Could not parse numeric session ID from: ${sessionId}, lastPart: ${lastPart}`);
+    return res.status(400).json({ error: 'Could not parse numeric session ID' });
+  }
+  
+  // Update the current session in the repository
+  try {
+    serverRepository.db.prepare('UPDATE servers SET chat_session_id = ? WHERE id = ?')
+      .run(numericSessionId, serverId);
+    console.log(`[CHAT SESSION] Server ${serverId} now using session ${numericSessionId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[CHAT SESSION] Error updating session:', error);
+    res.status(500).json({ error: 'Failed to update chat session' });
   }
 });
 

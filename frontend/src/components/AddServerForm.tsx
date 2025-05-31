@@ -174,7 +174,12 @@ const AddServerForm: React.FC = () => {
         setError('');
         // User will click 'Continue to Review' in modal to go to step 3
       } else {
-        setError(result.error || 'Connection test failed. Please check details and try again.');
+        // Specific handling for duplicate server errors
+        if (result.error && result.error.includes('already exists')) {
+          setError('This server already exists. Please delete the existing server first if you wish to update it.');
+        } else {
+          setError(result.error || 'Connection test failed. Please check details and try again.');
+        }
       }
     } catch (e: any) {
       const errorMsg = e?.response?.data?.error || e.message || 'An unknown error occurred during the connection test.';
@@ -211,7 +216,12 @@ const AddServerForm: React.FC = () => {
       });
       navigate('/');
     } catch (err: any) {
-      setError(err.message || 'Failed to add the server. An unexpected error occurred.');
+      // Check for duplicate server error
+      if (err.response?.data?.error?.includes('already exists')) {
+        setError('A server with this host and username already exists. Please use a different server or user.');
+      } else {
+        setError(err.response?.data?.error || err.message || 'Failed to add the server. An unexpected error occurred.');
+      }
     }
   };
 
@@ -580,7 +590,6 @@ const AddServerForm: React.FC = () => {
                   cursor: 'pointer',
                   textAlign: 'left'
                 }}
-                aria-expanded={Boolean(expandedHelp === item.id)}
                 aria-controls={`help-content-${item.id}`}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1 }}>
