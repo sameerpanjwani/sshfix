@@ -582,6 +582,53 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
           </div>
         </div>
       )}
+      {/* Add a dedicated section for Gemini terminal suggestions */}
+      {geminiSuggestions && geminiSuggestions.length > 0 && (
+        <div style={{ 
+          background: '#f0f8ff', 
+          borderRadius: 8, 
+          padding: 12, 
+          marginBottom: 16, 
+          border: '1px solid #bfdbfe' 
+        }}>
+          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 8, color: '#1e40af' }}>
+            Terminal Suggestions
+          </div>
+          {geminiSuggestions.slice(-2).map((suggestion, idx) => {
+            const suggestionJson = suggestion.json || {};
+            const nextCommand = suggestionJson.nextCommand || '';
+            const explanation = suggestionJson.explanation || '';
+            
+            return (
+              <div key={idx} style={{ marginBottom: idx < geminiSuggestions.length - 1 ? 12 : 0 }}>
+                {nextCommand && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>Try:</div>
+                    <div 
+                      style={{ 
+                        background: '#e0f2fe', 
+                        padding: '4px 10px', 
+                        borderRadius: 4, 
+                        fontFamily: 'monospace', 
+                        cursor: 'pointer',
+                        fontSize: 14 
+                      }}
+                      onClick={() => sendToTerminal && sendToTerminal(nextCommand)}
+                    >
+                      {nextCommand}
+                    </div>
+                  </div>
+                )}
+                {explanation && (
+                  <div style={{ fontSize: 13, color: '#4b5563', marginLeft: 8, marginTop: 4, marginBottom: 4 }}>
+                    {explanation.substring(0, 120)}{explanation.length > 120 ? '...' : ''}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       <div style={{ flex: 1, overflowY: 'auto', marginBottom: 12, padding: 8, background: '#fff', borderRadius: 8, boxShadow: '0 1px 4px #0001', maxHeight: panelHeight }}>
         {history.map((msg, i) => {
           const isAI = msg.role === 'ai';

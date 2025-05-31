@@ -1,260 +1,246 @@
 const axios = require('axios');
 const serverRepository = require('../repositories/serverRepository');
 
+// Cache for recent suggestions to avoid duplicate calls for the same input
+const suggestionCache = new Map();
+const CACHE_TTL = 1000 * 60 * 5; // 5 minutes
+
 class TerminalSuggestionService {
   async getSuggestions({ entries, latestCommand, serverId, sessionId }) {
-    console.log('[TERMINAL-SUGGEST] Received latestCommand:', latestCommand);
-    console.log('[TERMINAL-SUGGEST] Received serverId:', serverId, 'sessionId:', sessionId);
-    
-    // If we have serverId and sessionId, fetch session-specific history from database
-    let contextEntries = entries; // fallback to provided entries
-    let actualLatestCommand = latestCommand;
-    
-    if (serverId && sessionId !== null && sessionId !== undefined && !isNaN(sessionId)) {
-      try {
-        // Get unique commands by using GROUP BY and taking the most recent output for each command
-        const sessionHistory = await serverRepository.getSessionHistory(serverId, sessionId);
-        
-        if (sessionHistory.length > 0) {
-          contextEntries = sessionHistory.map(h => ({
-            command: h.command || '',
-            output: (h.output || '').slice(0, 1000)
-          }));
-          // Use the most recent command from database
-          actualLatestCommand = sessionHistory[0]?.command || latestCommand;
-          console.log('[TERMINAL-SUGGEST] Using latest command from DB:', actualLatestCommand);
-        }
-      } catch (dbError) {
-        console.error('[TERMINAL-SUGGEST] Database error:', dbError);
-      }
-    }
-    
-    console.log('[TERMINAL-SUGGEST] Final entries for context:', JSON.stringify(contextEntries, null, 2));
-    console.log('[TERMINAL-SUGGEST] Final latest command:', actualLatestCommand);
-
-    // Build prompt for Gemini
-    let prompt = this.buildPrompt(contextEntries);
-
-    return this.callGeminiAPI(prompt);
-  }
-
-  async getAlternativeSuggestions({ entries, previousSuggestion }) {
-    if (!Array.isArray(entries) || entries.length === 0 || !previousSuggestion) {
-      throw new Error('Missing entries or previousSuggestion');
-    }
-
-    const prompt = this.buildAlternativePrompt(entries, previousSuggestion);
-    return this.callGeminiAPI(prompt);
-  }
-
-  buildPrompt(entries) {
-    let prompt = `You are a helpful Linux system administrator assistant. Based on the recent terminal command history below, suggest the next logical command that the user might want to run.
-
-Recent command history (most recent last):
-`;
-
-    // Add commands in chronological order (oldest to newest)
-    const chronologicalEntries = [...entries].reverse();
-    chronologicalEntries.forEach((entry, i) => {
-      const cmd = entry.command || '';
-      const out = entry.output || '';
-      prompt += `\n${i + 1}. Command: ${cmd}\n`;
-      if (out.trim()) {
-        // Look for common error patterns in the output
-        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
-        const outputPrefix = hasError ? 'Error Output' : 'Output';
-        // Increase truncation limit for error messages
-        const truncateLimit = hasError ? 2000 : 1000;
-        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
-        // Format output with proper indentation and line breaks
-        const lines = truncatedOutput.split('\n');
-        const formattedOutput = lines
-          .filter(line => line.trim()) // Remove empty lines
-          .map(line => `   ${line.trim()}`) // Indent each line
-          .join('\n');
-        prompt += `   ${outputPrefix}:\n${formattedOutput}\n`;
-      }
+    console.log('[TerminalSuggestionService] Getting suggestions for:', {
+      entriesCount: entries?.length,
+      latestCommand,
+      serverId,
+      sessionId
     });
-
-    prompt += '\n\nBased on this command history, suggest the next logical command that would help the user.';
-    return prompt;
-  }
-
-  buildAlternativePrompt(entries, previousSuggestion) {
-    let prompt = 'The user just ran these recent commands in the terminal (oldest to newest):\n';
     
-    // Show commands in chronological order
-    const chronologicalEntries = [...entries].reverse();
-    chronologicalEntries.forEach((e, idx) => {
-      const cmd = this.escapeForPrompt(e.command);
-      const out = this.escapeForPrompt(e.output);
-      // Look for common error patterns in the output
-      const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
-      const outputPrefix = hasError ? 'Error Output:' : 'Output:';
-      // Increase truncation limit for error messages
-      const truncateLimit = hasError ? 2000 : 1000;
-      const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
-      prompt += `\n${idx + 1}. $ ${cmd}\n   ${outputPrefix} ${truncatedOutput}`;
-    });
-
-    const prev = typeof previousSuggestion === 'object' ? 
-      JSON.stringify(previousSuggestion.json || previousSuggestion.response || previousSuggestion) : 
-      this.escapeForPrompt(previousSuggestion);
-    
-    prompt += `\n\nThe previous suggestion was: ${prev}\n`;
-    prompt += `\nBased on the most recent command "${this.escapeForPrompt(entries[0]?.command || '')}" and its output, suggest an alternative next best command or troubleshooting step. If you see any errors in the output, suggest commands that would help fix those errors or provide alternatives that would work better.
-
-Provide your response as a JSON object with:
-- "answer": A brief explanation of what the suggested command does, mentioning any errors seen and how to fix them
-- "commands": An array of 1-3 suggested commands (just the command strings)
-- "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
-  1. What the command does
-  2. Why it's relevant after the previous command (especially if fixing an error)
-  3. What output to expect
-  4. Any potential errors to watch out for and how to handle them
-
-Do not repeat the previous suggestion's commands.`;
-
-    return prompt;
-  }
-
-  escapeForPrompt(str) {
-    if (!str || typeof str !== 'string') return 'N/A';
-    return str.replace(/[`$\\]/g, match => '\\' + match).replace(/\u0000/g, '');
-  }
-
-  async callGeminiAPI(prompt) {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    if (!geminiApiKey) {
-      throw new Error('Gemini API key not configured');
-    }
-
-    const geminiModel = 'gemini-2.5-flash-preview-04-17';
-    const geminiPayload = {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.7,
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 8192,
-        stopSequences: []
-      }
-    };
-
     try {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        geminiPayload,
-        {
-          headers: { 'Content-Type': 'application/json' }
-        }
-      );
-
-      if (response.status !== 200) {
-        throw new Error(`Gemini API error: ${response.status}`);
-      }
-
-      const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      console.log('[TERMINAL-SUGGEST] Raw Gemini response:', rawText);
-
-      const jsonText = this.extractJSON(rawText);
-      console.log('[TERMINAL-SUGGEST] Extracted JSON:', jsonText);
-      
-      if (!jsonText) {
-        console.error('[TERMINAL-SUGGEST] Could not extract JSON from response');
-        return {
-          response: "Here are some suggested commands based on your recent activity",
-          json: {
-            answer: "Here are some suggested commands based on your recent activity",
-            commands: ["ls -l", "pwd", "df -h"],
-            explanations: [
-              "List files with details",
-              "Show current directory",
-              "Show disk usage"
-            ]
-          },
-          prompt: prompt,
-          error: 'Failed to parse Gemini response, using fallback suggestions'
+      // Skip if no entries or latest command
+      if (!entries || entries.length === 0 || !latestCommand) {
+        console.log('[TerminalSuggestionService] Skipping suggestions due to missing data');
+        return { 
+          response: null,
+          json: null,
+          error: 'Missing required data'
         };
       }
       
-      try {
-        const parsedJson = JSON.parse(jsonText);
+      // Generate a cache key based on input
+      const cacheKey = this._generateCacheKey(entries, latestCommand, serverId, sessionId);
+      
+      // Check cache first
+      if (suggestionCache.has(cacheKey)) {
+        console.log('[TerminalSuggestionService] Using cached suggestion');
+        return suggestionCache.get(cacheKey);
+      }
+      
+      // Get server info to provide context
+      const server = serverRepository.getServer(serverId);
+      if (!server) {
+        console.error('[TerminalSuggestionService] Server not found:', serverId);
+        return { error: 'Server not found' };
+      }
+      
+      // Clean entries to only include command and output
+      const cleanEntries = entries.map(entry => ({
+        command: entry.command || '',
+        output: typeof entry.output === 'string' ? entry.output.substring(0, 1000) : ''
+      }));
+      
+      // Prepare prompt with session context
+      const prompt = this._buildPrompt(cleanEntries, latestCommand, server, sessionId);
+      
+      // Use OpenAI or fallback to local processing
+      let model = process.env.GEMINI_API_KEY ? 'gemini-1.5-flash' : 'local';
+      
+      if (model === 'gemini-1.5-flash') {
+        const result = await this._callGemini(prompt, cleanEntries, latestCommand);
         
-        if (!parsedJson.answer || !Array.isArray(parsedJson.commands)) {
-          throw new Error('Invalid response format - missing required fields');
-        }
+        // Cache the result
+        suggestionCache.set(cacheKey, result);
+        setTimeout(() => suggestionCache.delete(cacheKey), CACHE_TTL);
         
-        // Clean up explanations
-        if (Array.isArray(parsedJson.explanations)) {
-          parsedJson.explanations = parsedJson.explanations.map(exp => {
-            if (typeof exp === 'string') return exp;
-            if (typeof exp === 'object') {
-              return Object.values(exp).join(' ');
-            }
-            return String(exp);
-          });
-        }
+        return result;
+      } else {
+        // Local fallback (simple suggestion)
+        const fallbackResult = this._generateLocalSuggestion(cleanEntries, latestCommand);
         
-        // Ensure explanations exist and match commands length
-        if (!Array.isArray(parsedJson.explanations) || parsedJson.explanations.length !== parsedJson.commands.length) {
-          parsedJson.explanations = parsedJson.commands.map(cmd => {
-            if (cmd.startsWith('ls')) return 'List directory contents with detailed information. This shows file permissions, sizes, and timestamps. Expect a detailed listing of files and directories.';
-            if (cmd.startsWith('cd')) return 'Change directory to explore contents. This moves you into the specified directory. Expect to be in the new directory after execution.';
-            if (cmd.startsWith('ps')) return 'Show running processes and their status. This displays information about active processes. Expect a list of processes with details like CPU and memory usage.';
-            if (cmd.startsWith('top')) return 'Monitor system processes in real-time. This shows a dynamic view of system resource usage. Expect an interactive display of process information that updates regularly.';
-            if (cmd.startsWith('df')) return 'Show disk space usage. This displays filesystem space utilization. Expect a list of mounted filesystems with their total, used, and available space.';
-            if (cmd.startsWith('du')) return 'Show directory space usage. This calculates disk usage of directories. Expect a list of directories with their total sizes.';
-            return `Execute the ${cmd} command. This will run in your current shell context. Check the output carefully before running any further commands.`;
-          });
-        }
+        // Cache the result
+        suggestionCache.set(cacheKey, fallbackResult);
+        setTimeout(() => suggestionCache.delete(cacheKey), CACHE_TTL);
         
-        return {
-          response: parsedJson.answer,
-          json: parsedJson,
-          prompt: prompt
-        };
-      } catch (parseError) {
-        console.error('[TERMINAL-SUGGEST] JSON parse error:', parseError);
-        
-        // Try to salvage partial response
-        const commandMatch = jsonText.match(/"commands":\s*\[(.*?)\]/s);
-        const answerMatch = jsonText.match(/"answer":\s*"([^"]+)"/);
-        
-        const salvaged = {
-          answer: answerMatch ? answerMatch[1] : "Here are some suggested commands based on your recent activity",
-          commands: commandMatch ? 
-            commandMatch[1].split(',')
-              .map(s => s.trim().replace(/^"|"$/g, ''))
-              .filter(s => s && !s.includes('"')) : 
-            ["ls -l", "pwd", "df -h"],
-          explanations: ["List files with details", "Show current directory", "Show disk usage"]
-        };
-        
-        return {
-          response: salvaged.answer,
-          json: salvaged,
-          prompt: prompt,
-          error: 'Partial parse of Gemini response'
-        };
+        return fallbackResult;
       }
     } catch (error) {
-      console.error('[TERMINAL-SUGGEST] Error:', error?.response?.data || error);
-      throw new Error('Failed to get suggestions: ' + (error?.response?.data?.error || error.message));
+      console.error('[TerminalSuggestionService] Error getting suggestions:', error);
+      return { 
+        error: error.message,
+        prompt: null,
+        response: null,
+        json: null
+      };
     }
   }
 
-  extractJSON(text) {
-    // First try to find JSON between code blocks
-    let match = text.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-    if (match) return match[1].trim();
+  _generateCacheKey(entries, latestCommand, serverId, sessionId) {
+    const entriesKey = entries.map(e => `${e.command}|${e.output?.substring(0, 20)}`).join('_');
+    return `${serverId}-${sessionId}-${latestCommand}-${entriesKey}`;
+  }
+
+  _buildPrompt(entries, latestCommand, server, sessionId) {
+    const serverInfo = `Server: ${server.name} (${server.host})`;
+    const sessionContext = sessionId ? `Session ID: ${sessionId}` : 'No session ID';
     
-    // If no code blocks, try to find outermost { }
-    match = text.match(/\{[\s\S]*\}/);
-    if (match) return match[0].trim();
+    const commandHistory = entries
+      .map(entry => 
+        `Command: ${entry.command}\nOutput: ${
+          entry.output?.length > 200 
+            ? entry.output.substring(0, 200) + '...' 
+            : entry.output || 'No output'
+        }`
+      )
+      .join('\n\n');
     
-    // If still no match, return null
-    return null;
+    return `
+You are an expert terminal assistant helping a user with their terminal session.
+${serverInfo}
+${sessionContext}
+
+Recent terminal commands and outputs:
+${commandHistory}
+
+Latest command: ${latestCommand}
+
+Based on the command history and latest command, suggest:
+1. The most helpful next command
+2. A brief explanation of what that command would do
+3. Alternative commands if relevant
+
+Your response must be valid JSON with these fields:
+{
+  "nextCommand": "suggested command",
+  "explanation": "brief explanation",
+  "alternatives": ["alt1", "alt2"]
+}
+`;
+  }
+
+  async _callGemini(prompt, entries, latestCommand) {
+    try {
+      console.log('[TerminalSuggestionService] Calling Gemini API');
+      
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error('GEMINI_API_KEY not set in environment variables');
+      }
+      
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          contents: [
+            {
+              parts: [
+                { text: prompt }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 1024
+          }
+        }
+      );
+      
+      const textResponse = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      console.log('[TerminalSuggestionService] Received Gemini response:', textResponse.substring(0, 100) + '...');
+      
+      // Parse JSON from response
+      let jsonResponse = null;
+      try {
+        // Extract JSON if wrapped in backticks
+        const jsonMatch = textResponse.match(/```(?:json)?([\s\S]*?)```/);
+        const jsonText = jsonMatch ? jsonMatch[1].trim() : textResponse.trim();
+        jsonResponse = JSON.parse(jsonText);
+      } catch (parseError) {
+        console.error('[TerminalSuggestionService] Error parsing JSON from response:', parseError);
+      }
+      
+      return {
+        response: textResponse,
+        json: jsonResponse,
+        prompt
+      };
+    } catch (error) {
+      console.error('[TerminalSuggestionService] Error calling Gemini API:', error);
+      
+      // Return a more helpful error object
+      return {
+        error: error.message,
+        status: error.response?.status,
+        response: null,
+        json: null,
+        prompt
+      };
+    }
+  }
+
+  _generateLocalSuggestion(entries, latestCommand) {
+    console.log('[TerminalSuggestionService] Generating local suggestion');
+    
+    // Get last command without the latest one
+    const previousCommands = entries
+      .slice(0, entries.length - 1)
+      .map(e => e.command)
+      .filter(Boolean);
+    
+    // Basic suggestions based on common patterns
+    let suggestion;
+    
+    if (latestCommand.startsWith('cd ')) {
+      suggestion = 'ls -la';
+    } else if (latestCommand.includes('git clone')) {
+      const repoName = latestCommand.split('/').pop().replace('.git', '');
+      suggestion = `cd ${repoName}`;
+    } else if (latestCommand === 'npm install' || latestCommand === 'yarn') {
+      suggestion = 'npm start';
+    } else if (latestCommand.startsWith('mkdir ')) {
+      const dirName = latestCommand.replace('mkdir ', '');
+      suggestion = `cd ${dirName}`;
+    } else if (latestCommand === 'ls' || latestCommand === 'ls -la' || latestCommand === 'dir') {
+      suggestion = 'cd dirname';
+    } else {
+      // Check for repeated command patterns
+      const commonCommands = this._findCommonCommands(previousCommands);
+      if (commonCommands.length > 0) {
+        suggestion = commonCommands[0];
+      } else {
+        suggestion = 'echo "Command completed successfully"';
+      }
+    }
+    
+    // Build a response object similar to the API response
+    return {
+      response: null,
+      json: {
+        nextCommand: suggestion,
+        explanation: 'Suggested based on command history patterns',
+        alternatives: ['clear', 'history']
+      },
+      prompt: null
+    };
+  }
+
+  _findCommonCommands(commands) {
+    // Count frequency of each command
+    const frequency = {};
+    commands.forEach(cmd => {
+      frequency[cmd] = (frequency[cmd] || 0) + 1;
+    });
+    
+    // Sort by frequency
+    return Object.entries(frequency)
+      .sort((a, b) => b[1] - a[1])
+      .map(entry => entry[0]);
   }
 }
 

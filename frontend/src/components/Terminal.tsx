@@ -14,6 +14,7 @@ interface TerminalEntry {
   command: string;
   output: string;
   created_at: string;
+  chat_session_id?: string | null;
 }
 
 interface TerminalProps {
@@ -25,9 +26,10 @@ interface TerminalProps {
   onGeminiSuggestion?: (suggestion: any) => void;
   onHistoryUpdate?: (history: TerminalEntry[]) => void;
   clearSignal?: number;
+  sessionId?: string | null;
 }
 
-const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, onQuickCommandUsed, panelHeight = 400, onHistoryUpdate, clearSignal }) => {
+const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, onQuickCommandUsed, panelHeight = 400, onHistoryUpdate, clearSignal, sessionId }) => {
   const xtermRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const historyRef = useRef<TerminalEntry[]>([]);
@@ -168,25 +170,60 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
         if (cleanCommand && cleanCommand.length > 0) {
           const commandOutput = outputMap.get(cleanCommand) || outputBuffer;
           
-          // Create new history entry
+          // Create new history entry with session ID
           const newEntry = { 
             command: cleanCommand, 
             output: commandOutput, 
-            created_at: new Date().toISOString() 
+            created_at: new Date().toISOString(),
+            chat_session_id: sessionId
           };
           
           historyRef.current = [...historyRef.current, newEntry];
           
           // Log command to backend
-          axios.post(`${API_BASE}/servers/${serverId}/history`, newEntry)
-            .then(() => axios.get(`${API_BASE}/servers/${serverId}/history`))
+          console.log('[Terminal.tsx] Sending history with session ID:', sessionId);
+          
+          axios.post(`${API_BASE}/terminal/history-with-suggestion`, {
+            serverId,
+            command: cleanCommand, 
+            output: commandOutput,
+            sessionId: sessionId || Date.now().toString()
+          })
             .then(response => {
+              console.log('[Terminal.tsx] Got response from history-with-suggestion:', {
+                historyLength: response.data.history?.length,
+                hasSuggestion: !!response.data.suggestion,
+                suggestionJson: response.data.suggestion?.json ? 
+                  Object.keys(response.data.suggestion.json) : [],
+                suggestionResponse: response.data.suggestion?.response ? 
+                  response.data.suggestion.response.substring(0, 100) : null
+              });
+              
               if (typeof onHistoryUpdate === 'function') {
+                console.log('[Terminal.tsx] Calling onHistoryUpdate with history+suggestion data');
                 onHistoryUpdate(response.data);
+              } else {
+                console.error('[Terminal.tsx] onHistoryUpdate function is not defined!');
               }
             })
             .catch(error => {
-              console.error('Error in history logging/fetching pipeline:', error);
+              console.error('[Terminal.tsx] Error in history-with-suggestion:', error);
+              
+              // Fallback to original history endpoint if new endpoint fails
+              axios.post(`${API_BASE}/servers/${serverId}/history`, {
+                ...newEntry,
+                chat_session_id: sessionId
+              })
+                .then(() => axios.get(`${API_BASE}/servers/${serverId}/history`))
+                .then(response => {
+                  if (typeof onHistoryUpdate === 'function') {
+                    console.log('[Terminal.tsx] Calling onHistoryUpdate with fallback history data');
+                    onHistoryUpdate(response.data);
+                  } else {
+                    console.error('[Terminal.tsx] onHistoryUpdate function is not defined in fallback!');
+                  }
+                })
+                .catch(err => console.error('[Terminal.tsx] Fallback history update failed:', err));
             });
           
           // Clear command from output map
@@ -251,7 +288,8 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
         // Log command immediately
         axios.post(`${API_BASE}/servers/${serverId}/history`, { 
           command: quickCommand, 
-          output: '' 
+          output: '',
+          chat_session_id: sessionId 
         }).catch(err => {
           console.error('[Terminal.tsx] Error logging quick command:', err);
         });
@@ -259,7 +297,7 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
         pendingCommandRef.current = quickCommand;
       }
     }
-  }, [quickCommand, serverId]);
+  }, [quickCommand, serverId, sessionId]);
 
   return (
     <div 

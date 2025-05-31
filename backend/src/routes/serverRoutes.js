@@ -204,26 +204,30 @@ router.post('/:id/set-chat-session', (req, res) => {
   
   console.log(`[CHAT SESSION] Received sessionId: "${sessionId}" for server ${serverId}`);
   
-  // Extract numeric session ID from string (e.g., "server-1-session-123" -> 123)
   if (!sessionId || typeof sessionId !== 'string') {
     console.error(`[CHAT SESSION] Invalid sessionId: ${sessionId}`);
     return res.status(400).json({ error: 'Valid sessionId is required' });
   }
   
-  const parts = sessionId.split('-');
-  const lastPart = parts[parts.length - 1];
-  const numericSessionId = parseInt(lastPart);
-  
-  if (isNaN(numericSessionId)) {
-    console.error(`[CHAT SESSION] Could not parse numeric session ID from: ${sessionId}, lastPart: ${lastPart}`);
-    return res.status(400).json({ error: 'Could not parse numeric session ID' });
-  }
+  // Normalize the session ID by removing any trailing .0
+  const normalizedSessionId = sessionId.endsWith('.0') 
+    ? sessionId.substring(0, sessionId.length - 2)
+    : sessionId;
   
   // Update the current session in the repository
   try {
     serverRepository.db.prepare('UPDATE servers SET chat_session_id = ? WHERE id = ?')
-      .run(numericSessionId, serverId);
-    console.log(`[CHAT SESSION] Server ${serverId} now using session ${numericSessionId}`);
+      .run(normalizedSessionId, serverId);
+    console.log(`[CHAT SESSION] Server ${serverId} now using session ${normalizedSessionId}`);
+    
+    // Update all history entries with server-X-session-default to use this session ID
+    serverRepository.db.prepare(`
+      UPDATE history 
+      SET chat_session_id = ? 
+      WHERE server_id = ? AND chat_session_id LIKE 'server-%-session-default'
+    `).run(normalizedSessionId, serverId);
+    console.log(`[CHAT SESSION] Updated history entries with default session to use ${normalizedSessionId}`);
+    
     res.json({ success: true });
   } catch (error) {
     console.error('[CHAT SESSION] Error updating session:', error);

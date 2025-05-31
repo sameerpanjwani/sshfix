@@ -5,13 +5,37 @@ import Chat from './Chat';
 import InteractiveTerminal from './Terminal';
 import axios from 'axios';
 
+// Constants
 const PANEL_HEIGHT = 700; // px, shared height for chat and terminal
+const API_BASE = window.location.origin.includes('localhost') 
+  ? 'http://localhost:4000/api' 
+  : '/api';
 
 // Define SessionInfo interface
 interface SessionInfo {
   sessionId: string;
   startTime: string;
   label: string;
+}
+
+// Add these type definitions after the SessionInfo interface
+interface TerminalEntry {
+  command: string;
+  output: string;
+  created_at?: string;
+  chat_session_id?: string | null;
+}
+
+interface TerminalSuggestion {
+  response?: string;
+  json?: any;
+  prompt?: string;
+  error?: string;
+}
+
+interface HistoryWithSuggestion {
+  history: TerminalEntry[];
+  suggestion: TerminalSuggestion;
 }
 
 const ServerDetail: React.FC = () => {
@@ -184,9 +208,73 @@ const ServerDetail: React.FC = () => {
     return history.slice(-6);
   };
 
+  // Add this helper function to format suggestions for the chat UI
+  const formatSuggestionForChat = (suggestion: TerminalSuggestion) => {
+    if (!suggestion) return null;
+    
+    try {
+      const json = suggestion.json || {};
+      
+      // Extract relevant data from the suggestion
+      const nextCommand = json.nextCommand || '';
+      const explanation = json.explanation || '';
+      const alternatives = Array.isArray(json.alternatives) ? json.alternatives : [];
+      
+      // Create a formatted message for the chat UI
+      return {
+        role: 'assistant',
+        message: `**Terminal Suggestion**\n\n💡 Try: \`${nextCommand}\`\n\n${explanation}\n\n${
+          alternatives.length > 0 
+            ? `**Alternatives:**\n${alternatives.map((alt: string) => `- \`${alt}\``).join('\n')}`
+            : ''
+        }`,
+        model: 'gemini',
+        timestamp: new Date().toISOString(),
+        isTerminalSuggestion: true
+      };
+    } catch (error) {
+      console.error('[ServerDetail.tsx] Error formatting suggestion:', error);
+      return null;
+    }
+  };
+
+  // Handler for direct suggestions from Terminal component
+  const handleDirectSuggestion = (suggestion: TerminalSuggestion) => {
+    console.log('[ServerDetail.tsx] Received direct suggestion from Terminal:', suggestion);
+    if (suggestion) {
+      // Format the suggestion for display
+      const formattedSuggestion = formatSuggestionForChat(suggestion);
+      
+      // Update state with the new suggestion
+      if (formattedSuggestion) {
+        setGeminiSuggestions(prev => {
+          const newSuggestions = [...prev, formattedSuggestion].slice(-3); // Keep last 3
+          return newSuggestions;
+        });
+      }
+    }
+  };
+
   // Enhanced onHistoryUpdate: update history and fetch Gemini suggestion
-  const handleHistoryUpdate = async (newHistory: any[]) => {
+  const handleHistoryUpdate = async (newHistoryData: TerminalEntry[] | HistoryWithSuggestion) => {
+    // Check if this is a combined history+suggestion response
+    if ('history' in newHistoryData && 'suggestion' in newHistoryData) {
+      const { history: newHistory, suggestion } = newHistoryData as HistoryWithSuggestion;
+      setHistory(newHistory); // Store global history
+      console.log('[ServerDetail.tsx] Found suggestion in history update', {
+        suggestionExists: !!suggestion,
+        suggestionJson: suggestion?.json,
+        suggestionResponse: suggestion?.response?.substring(0, 100)
+      });
+      
+      handleDirectSuggestion(suggestion);
+      return;
+    }
+    
+    // Otherwise, treat as a regular history array
+    const newHistory = newHistoryData as TerminalEntry[];
     setHistory(newHistory); // Store global history
+    console.log('[ServerDetail.tsx] Regular history update received, length:', newHistory.length);
     
     // Clear any existing timeout
     if (timeoutIdRef.current) {
@@ -196,67 +284,122 @@ const ServerDetail: React.FC = () => {
     // Set new timeout for debounced suggestion
     timeoutIdRef.current = setTimeout(async () => {
       try {
+        console.log('[ServerDetail.tsx] Debounced history update triggered');
+        
+        // Skip if no history entries
+        if (!newHistory || newHistory.length === 0) {
+          console.log('[ServerDetail.tsx] No history entries available, skipping suggestions');
+          return;
+        }
+        
         // Get current session ID
-        const capturedSessionId = currentChatSessionIdRef.current;
-        
-        // Skip if no session
-        if (capturedSessionId === null) {
-          console.log('[ServerDetail.tsx] No current session ID, skipping suggestions');
+        const currentSession = currentChatSessionIdRef.current;
+        if (!currentSession) {
+          console.log('[ServerDetail.tsx] No current session ID available, skipping suggestions');
           return;
         }
         
-        // Get latest entries for this session
-        const sessionHistory = newHistory.filter(e => 
-          e.chat_session_id === capturedSessionId
-        ).slice(-6);
+        console.log('[ServerDetail.tsx] Using current session ID:', currentSession);
         
-        // Skip if no entries
-        if (sessionHistory.length === 0) {
-          console.log('[ServerDetail.tsx] No commands available for suggestions');
-          return;
-        }
-        
-        // Format entries for suggestion API
-        const entriesForSuggestion = sessionHistory.map(e => ({
+        // Use the most recent 6 entries regardless of session ID
+        const entriesForSuggestion = newHistory.slice(-6).map(e => ({
           command: e.command || '',
-          output: (e.output || '').slice(0, 1000)
+          output: (e.output || '').slice(0, 1000) // Limit output length
         }));
         
         // Get latest command
-        const latestCommand = sessionHistory[sessionHistory.length - 1]?.command || '';
+        const latestCommand = newHistory[newHistory.length - 1]?.command || '';
+        
+        console.log('[ServerDetail.tsx] Using entries for suggestion:', entriesForSuggestion);
+        console.log('[ServerDetail.tsx] Latest command:', latestCommand);
         
         // Get base URL
         const baseUrl = window.location.origin.includes('localhost') 
           ? 'http://localhost:4000' 
           : window.location.origin;
         
-        console.log(`[ServerDetail.tsx] Sending suggestion request for session ${capturedSessionId}`);
-        console.log('[ServerDetail.tsx] Latest command:', latestCommand);
-        console.log('[ServerDetail.tsx] Entries:', entriesForSuggestion);
+        // Call suggestion API with the current session ID
+        console.log('[ServerDetail.tsx] Calling suggestion API at:', baseUrl + '/api/terminal/suggest');
+        console.log('[ServerDetail.tsx] Request payload:', {
+          entries: entriesForSuggestion,
+          latestCommand,
+          serverId: Number(id),
+          sessionId: currentSession
+        });
         
-        // Call suggestion API
         const response = await axios.post(baseUrl + '/api/terminal/suggest', {
           entries: entriesForSuggestion,
           latestCommand,
           serverId: Number(id),
-          sessionId: capturedSessionId
+          sessionId: currentSession
         });
         
         // Update suggestions if we got a valid response
         if (response.data && (response.data.response || response.data.json)) {
+          console.log('[ServerDetail.tsx] Got valid response from suggestion API:', {
+            hasResponse: !!response.data.response,
+            hasJson: !!response.data.json,
+            jsonKeys: response.data.json ? Object.keys(response.data.json) : [],
+            responsePreview: response.data.response ? response.data.response.substring(0, 100) : ''
+          });
+          
+          // Before updating suggestions state, check what's currently there
+          console.log('[ServerDetail.tsx] Current geminiSuggestions length:', geminiSuggestions.length);
+          
+          // Format the suggestion properly for display
+          const formattedSuggestion = formatSuggestionForChat(response.data);
+          console.log('[ServerDetail.tsx] Formatted suggestion:', formattedSuggestion);
+          
           setGeminiSuggestions(prev => {
             const newSuggestions = [...prev, response.data].slice(-3); // Keep last 3
+            console.log('[ServerDetail.tsx] Updated geminiSuggestions length will be:', newSuggestions.length);
             return newSuggestions;
           });
         } else if (response.data && response.data.error) {
           console.error('[ServerDetail.tsx] Backend error for terminal suggestion:', response.data.error);
+        } else {
+          console.log('[ServerDetail.tsx] Unexpected API response format:', response.data);
         }
       } catch (error) {
         console.error('[ServerDetail.tsx] Error fetching Gemini suggestion:', error);
+        if (axios.isAxiosError(error)) {
+          console.error('[ServerDetail.tsx] Axios error details:', {
+            status: error.response?.status,
+            data: error.response?.data,
+            message: error.message
+          });
+        }
       }
-    }, 1000); // Increased debounce to 1 second
+    }, 1000); // Debounce 1 second
   };
   
+  // Run onHistoryUpdate effect to get initial suggestions
+  useEffect(() => {
+    // Ensure we have a session ID for this server
+    const ensureSessionId = async () => {
+      if (!server?.id) return;
+      
+      // Create a timestamp-based session ID if none exists
+      const sessionId = server.chat_session_id || Date.now().toString();
+      
+      console.log('[ServerDetail] Ensuring session ID for server', server.id, 'Current:', server.chat_session_id, 'Using:', sessionId);
+      
+      // Set session ID on server if needed
+      if (!server.chat_session_id) {
+        try {
+          await axios.post(`${API_BASE}/servers/${server.id}/set-chat-session`, { sessionId });
+          console.log('[ServerDetail] Set new session ID for server:', sessionId);
+          // Update local server state with new session ID
+          setServer((prev: any) => prev ? {...prev, chat_session_id: sessionId} : null);
+        } catch (error) {
+          console.error('[ServerDetail] Error setting session ID:', error);
+        }
+      }
+    };
+    
+    ensureSessionId();
+  }, [server?.id]);
+
   if (loading || !server) return <div>Loading...</div>;
 
   return (
@@ -310,6 +453,7 @@ const ServerDetail: React.FC = () => {
             }}
             onHistoryUpdate={handleHistoryUpdate}
             clearSignal={terminalClearSignal}
+            sessionId={server?.chat_session_id}
           />
         </div>
         {/* Chat (Right) */}
@@ -349,6 +493,120 @@ const ServerDetail: React.FC = () => {
               </>
             )}
             {testing && <div style={{ color: '#888', marginTop: 16 }}>Please wait...</div>}
+          </div>
+        </div>
+      )}
+      {/* Gemini Suggestions Tab Section */}
+      {geminiSuggestions.length > 0 && (
+        <div style={{ 
+          marginBottom: 16, 
+          background: '#f0f4ff', 
+          borderRadius: 10, 
+          boxShadow: '0 1px 4px #0001', 
+          padding: 12, 
+          border: '1px solid #b6d0ff', 
+          position: 'relative',
+          maxHeight: '300px',
+          overflowY: 'auto'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, justifyContent: 'space-between' }}>
+            <div style={{ fontWeight: 700, color: '#2563eb', fontSize: 16 }}>
+              Terminal Suggestions ({geminiSuggestions.length})
+            </div>
+            <span 
+              style={{ 
+                fontSize: 13, 
+                color: '#2563eb', 
+                background: '#f8fafc', 
+                borderRadius: 6, 
+                padding: '2px 10px', 
+                zIndex: 2, 
+                cursor: 'pointer', 
+                textDecoration: 'underline' 
+              }} 
+              onClick={() => console.log('Current suggestions:', geminiSuggestions)}
+            >
+              Debug Suggestions
+            </span>
+          </div>
+          <div style={{ maxHeight: 180, overflowY: 'auto' }}>
+            {geminiSuggestions.map((suggestion, idx) => {
+              console.log(`[DEBUG] Rendering suggestion ${idx}:`, suggestion);
+              
+              // Get data from various possible formats
+              const json = suggestion.json || {};
+              const nextCommand = json.nextCommand || '';
+              const explanation = json.explanation || '';
+              const alternatives = Array.isArray(json.alternatives) ? json.alternatives : [];
+              
+              return (
+                <div 
+                  key={idx} 
+                  style={{ 
+                    marginBottom: 12, 
+                    background: '#fff', 
+                    borderRadius: 8, 
+                    padding: 10, 
+                    boxShadow: '0 1px 2px #0001', 
+                    border: '1px solid #e0e7ff',
+                    position: 'relative' 
+                  }}
+                >
+                  {/* Show suggestion details */}
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={{ fontWeight: 600, color: '#1e3a8a', marginBottom: 4 }}>
+                      Suggested Command:
+                    </div>
+                    <div 
+                      style={{ 
+                        background: '#f5f3ff', 
+                        padding: '6px 12px', 
+                        borderRadius: 6, 
+                        fontFamily: 'monospace', 
+                        cursor: 'pointer',
+                        border: '1px solid #e9d5ff',
+                        marginBottom: 8
+                      }}
+                      onClick={() => handleQuickCommand(nextCommand)}
+                    >
+                      {nextCommand || 'No command suggestion available'}
+                    </div>
+                    
+                    {explanation && (
+                      <div style={{ marginTop: 8, fontSize: 14, color: '#4b5563' }}>
+                        {explanation}
+                      </div>
+                    )}
+                    
+                    {alternatives && alternatives.length > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        <div style={{ fontWeight: 600, color: '#1e3a8a', marginBottom: 4, fontSize: 14 }}>
+                          Alternatives:
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                          {alternatives.map((alt: string, i: number) => (
+                            <div
+                              key={i}
+                              style={{
+                                background: '#e0e7ff',
+                                padding: '4px 10px',
+                                borderRadius: 4,
+                                fontSize: 13,
+                                cursor: 'pointer',
+                                color: '#4338ca'
+                              }}
+                              onClick={() => handleQuickCommand(alt)}
+                            >
+                              {alt}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

@@ -2,9 +2,10 @@ const express = require('express');
 const router = express.Router();
 const chatRepository = require('../repositories/chatRepository');
 const aiService = require('../services/aiService');
+const { cleanAIResponse } = require('../utils/ai');
 
 // Get chat history for a server
-router.get('/:id/chat', (req, res) => {
+router.get('/servers/:id/chat', (req, res) => {
   const { date, sessionId } = req.query;
   const serverId = req.params.id;
 
@@ -33,7 +34,7 @@ router.get('/:id/chat', (req, res) => {
 });
 
 // Add chat message
-router.post('/:id/chat', (req, res) => {
+router.post('/servers/:id/chat', (req, res) => {
   const { role, message, chatSessionId } = req.body;
   const serverId = req.params.id;
 
@@ -54,28 +55,8 @@ router.post('/:id/chat', (req, res) => {
   }
 });
 
-// Process AI request
-router.post('/ai', async (req, res) => {
-  try {
-    const result = await aiService.processAIRequest({
-      ...req.body,
-      req
-    });
-    res.json(result);
-  } catch (error) {
-    console.error('AI endpoint error:', error);
-    res.status(500).json({ error: error.message || 'Unknown server error', details: error.response?.data || null });
-  }
-});
-
-// Get available AI models
-router.get('/available', async (req, res) => {
-  const models = await aiService.getAvailableModels();
-  res.json(models);
-});
-
 // List chat sessions for a server
-router.get('/:id/chat-sessions', (req, res) => {
+router.get('/servers/:id/chat-sessions', (req, res) => {
   try {
     const sessions = chatRepository.getChatSessions(req.params.id);
     

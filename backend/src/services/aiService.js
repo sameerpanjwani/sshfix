@@ -45,6 +45,52 @@ class AIService {
     // Get chat history
     let chatHistory = await chatRepository.getChatHistory(serverId, chatSessionId);
 
+    // Add terminal context if requested
+    if (withTerminalContext && serverId && chatSessionId) {
+      try {
+        console.log('[AIService] Including terminal context for session', chatSessionId);
+        const serverRepository = require('../repositories/serverRepository');
+        
+        // Get terminal history for this session
+        const terminalHistory = await serverRepository.getSessionHistory(serverId, chatSessionId);
+        
+        if (terminalHistory && terminalHistory.length > 0) {
+          console.log('[AIService] Found', terminalHistory.length, 'terminal history entries');
+          
+          // Add a system message with the terminal context
+          let terminalContextMsg = 'Recent terminal commands and their outputs:\n\n';
+          
+          // Add the terminal history in chronological order (oldest to newest)
+          [...terminalHistory].reverse().forEach((entry, i) => {
+            if (entry.command && entry.command.trim()) {
+              terminalContextMsg += `Command ${i+1}: ${entry.command.trim()}\n`;
+              if (entry.output && entry.output.trim()) {
+                // Truncate very long outputs
+                const truncatedOutput = entry.output.length > 1000 
+                  ? entry.output.slice(0, 1000) + '... [output truncated]' 
+                  : entry.output;
+                terminalContextMsg += `Output ${i+1}:\n${truncatedOutput}\n\n`;
+              } else {
+                terminalContextMsg += `Output ${i+1}: [No output available]\n\n`;
+              }
+            }
+          });
+          
+          // Add this context as a system message
+          messages.push({ 
+            role: 'system', 
+            content: terminalContextMsg + '\nPlease consider these terminal commands and their outputs when responding to the user.'
+          });
+          
+          console.log('[AIService] Added terminal context to AI prompt');
+        } else {
+          console.log('[AIService] No terminal history found for session', chatSessionId);
+        }
+      } catch (error) {
+        console.error('[AIService] Error adding terminal context:', error);
+      }
+    }
+
     // Process images
     let allPrevImageUrls = [];
     chatHistory.forEach(m => {

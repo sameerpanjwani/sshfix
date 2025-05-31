@@ -20,12 +20,14 @@ const serverRoutes = require('./src/routes/serverRoutes');
 const chatRoutes = require('./src/routes/chatRoutes');
 const terminalRoutes = require('./src/routes/terminalRoutes');
 const uploadRoutes = require('./src/routes/uploadRoutes');
+const aiRoutes = require('./src/routes/aiRoutes');
 
 // Mount routes
 app.use('/api/servers', serverRoutes);
-app.use('/api/chat', chatRoutes);
+app.use('/api', chatRoutes);
 app.use('/api/terminal', terminalRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/ai', aiRoutes);
 
 // Serve uploaded images statically
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));

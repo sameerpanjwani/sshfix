@@ -7,27 +7,41 @@ class ServerRepository {
   }
 
   getSessionHistory(serverId, sessionId) {
+    console.log('[ServerRepository] Getting session history for server:', serverId, 'session:', sessionId);
+    
+    // Normalize session ID to handle potential different formats
+    let normalizedSessionId = String(sessionId);
+    if (normalizedSessionId.endsWith('.0')) {
+      normalizedSessionId = normalizedSessionId.replace('.0', '');
+    }
+    
+    // Format for when sessionId is prefixed with server-X-session-
+    const alternateSessionId = `server-${serverId}-session-${normalizedSessionId}`;
+    
+    // Try different sessionId formats
+    const query = `
+      SELECT * FROM history
+      WHERE server_id = ? AND (
+        chat_session_id = ? OR
+        chat_session_id = ? OR
+        (chat_session_id IS NULL AND server_id = ?)
+      )
+      ORDER BY created_at ASC
+    `;
+    
     try {
-      // Get unique commands by using GROUP BY and taking the most recent output for each command
-      return this.db.prepare(`
-        WITH RankedHistory AS (
-          SELECT 
-            command,
-            output,
-            created_at,
-            ROW_NUMBER() OVER (PARTITION BY command ORDER BY created_at DESC) as rn
-          FROM history 
-          WHERE server_id = ? AND chat_session_id = ?
-        )
-        SELECT command, output, created_at
-        FROM RankedHistory
-        WHERE rn = 1
-        ORDER BY created_at DESC 
-        LIMIT 6
-      `).all(serverId, sessionId);
+      const results = this.db.prepare(query).all(
+        serverId, 
+        normalizedSessionId, 
+        alternateSessionId,
+        serverId
+      );
+      
+      console.log('[ServerRepository] Found', results.length, 'history entries');
+      return results;
     } catch (error) {
       console.error('[ServerRepository] Error getting session history:', error);
-      throw error;
+      return [];
     }
   }
 
@@ -88,8 +102,19 @@ class ServerRepository {
 
   addHistory(serverId, command, output, chatSessionId = null) {
     try {
+      // If no chat session ID is provided, try to get the current session
+      let sessionId = chatSessionId;
+      if (!sessionId) {
+        const server = this.getCurrentSession(serverId);
+        sessionId = server ? server.chat_session_id : null;
+        console.log('[ServerRepository] Using current session ID:', sessionId, 'for server', serverId);
+      }
+      
+      // Insert the history entry with the session ID
       const stmt = this.db.prepare('INSERT INTO history (server_id, command, output, chat_session_id) VALUES (?, ?, ?, ?)');
-      const info = stmt.run(serverId, command, output, chatSessionId);
+      const info = stmt.run(serverId, command, output, sessionId);
+      
+      console.log('[ServerRepository] Added history with ID:', info.lastInsertRowid, 'and session ID:', sessionId);
       return info.lastInsertRowid;
     } catch (error) {
       console.error('[ServerRepository] Error adding history:', error);
@@ -137,9 +162,42 @@ class ServerRepository {
 
   getCurrentSession(serverId) {
     try {
-      return this.db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+      const result = this.db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+      console.log('[ServerRepository] Current session for server', serverId, ':', result);
+      return result;
     } catch (error) {
       console.error('[ServerRepository] Error getting current session:', error);
+      throw error;
+    }
+  }
+
+  saveHistory(serverId, historyEntry) {
+    console.log('[ServerRepository] Saving history for server:', serverId);
+    
+    try {
+      // Check if the server has a current session ID
+      const serverInfo = this.db.prepare('SELECT chat_session_id FROM servers WHERE id = ?').get(serverId);
+      const sessionId = historyEntry.chat_session_id || (serverInfo ? serverInfo.chat_session_id : null);
+      
+      console.log('[ServerRepository] Using session ID:', sessionId);
+      
+      const stmt = this.db.prepare(`
+        INSERT INTO history (server_id, command, output, created_at, chat_session_id)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      
+      const result = stmt.run(
+        serverId,
+        historyEntry.command,
+        historyEntry.output || '',
+        historyEntry.created_at || new Date().toISOString(),
+        sessionId
+      );
+      
+      console.log('[ServerRepository] History saved with ID:', result.lastInsertRowid);
+      return result.lastInsertRowid;
+    } catch (error) {
+      console.error('[ServerRepository] Error saving history:', error);
       throw error;
     }
   }
