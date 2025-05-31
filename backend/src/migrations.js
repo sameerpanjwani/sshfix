@@ -3,7 +3,7 @@ const path = require('path');
 
 function runMigrations() {
   console.log('[MIGRATIONS] Starting database migrations...');
-  const db = new Database(path.join(__dirname, 'sshfix.db'));
+  const db = new Database(path.join(__dirname, '../sshfix.db'));
 
   try {
     // Create servers table
