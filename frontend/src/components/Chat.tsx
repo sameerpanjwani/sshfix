@@ -385,7 +385,7 @@ const Chat: React.FC<ChatProps> = ({ onQuickCommand, panelHeight = 400, serverId
     const entries = getLastTerminalEntries();
     // Call backend for alternative suggestion
     const baseUrl = window.location.origin.includes('localhost') ? 'http://localhost:4000' : window.location.origin;
-    const res = await fetch(baseUrl + '/api/ai/terminal-suggest-alt', {
+    const res = await fetch(baseUrl + '/api/terminal/suggest-alt', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ entries, previousSuggestion: lastSuggestion })

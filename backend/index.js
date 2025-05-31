@@ -8,6 +8,7 @@ const axios = require('axios');
 const multer = require('multer');
 const fs = require('fs');
 const WebSocket = require('ws');
+const { runMigrations } = require('./migrations');
 
 // Load environment variables
 dotenv.config();
@@ -19,49 +20,8 @@ app.use(express.json());
 // Initialize SQLite database
 const db = new Database(path.join(__dirname, 'sshfix.db'));
 
-// Create tables with all necessary columns
-console.log('[DB] Creating tables...');
-db.exec(`
-CREATE TABLE IF NOT EXISTS servers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  host TEXT NOT NULL,
-  port INTEGER DEFAULT 22,
-  username TEXT NOT NULL,
-  password TEXT,
-  privateKey TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  server_id INTEGER,
-  command TEXT NOT NULL,
-  output TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  chat_session_id INTEGER NULL,
-  FOREIGN KEY(server_id) REFERENCES servers(id)
-);
-
-CREATE TABLE IF NOT EXISTS context (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  server_id INTEGER,
-  key TEXT NOT NULL,
-  value TEXT,
-  FOREIGN KEY(server_id) REFERENCES servers(id)
-);
-
-CREATE TABLE IF NOT EXISTS chat_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  server_id INTEGER,
-  role TEXT NOT NULL,
-  message TEXT NOT NULL,
-  chat_session_id TEXT NOT NULL DEFAULT 'default_session_0',
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  ai_request_context TEXT NULL,
-  FOREIGN KEY(server_id) REFERENCES servers(id)
-);
-`);
+// Run migrations
+runMigrations();
 
 // Global variable to track current chat session ID per server
 const currentChatSessions = new Map(); // serverId -> sessionId
@@ -84,6 +44,16 @@ const imageFilter = (req, file, cb) => {
   cb(null, true);
 };
 const upload = multer({ storage, fileFilter: imageFilter, limits: { files: 5, fileSize: 5 * 1024 * 1024 } });
+
+// Import routes
+const serverRoutes = require('./src/routes/serverRoutes');
+const chatRoutes = require('./src/routes/chatRoutes');
+const terminalRoutes = require('./src/routes/terminalRoutes');
+
+// Mount routes
+app.use('/api/servers', serverRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/terminal', terminalRoutes);
 
 // API: List servers
 app.get('/api/servers', (req, res) => {
@@ -144,7 +114,7 @@ app.post('/api/servers/:id/history', (req, res) => {
       new Date().toISOString()
     );
 
-    // Get updated history for this session
+    // Get updated history
     const history = db.prepare(`
       SELECT * FROM history 
       WHERE server_id = ? 
@@ -155,7 +125,7 @@ app.post('/api/servers/:id/history', (req, res) => {
     res.json(history);
   } catch (error) {
     console.error('Error adding history:', error);
-    res.status(500).json({ error: 'Failed to add history' });
+    res.status(500).json({ error: 'Failed to add history: ' + error.message });
   }
 });
 
@@ -894,342 +864,6 @@ app.post('/api/upload', upload.array('images', 5), (req, res) => {
 // Serve uploaded images statically
 app.use('/uploads', express.static(uploadDir));
 
-// --- Terminal Suggestion Endpoint (Gemini Flash) ---
-// Accepts up to 6 recent terminal entries for context
-app.post('/api/ai/terminal-suggest', async (req, res) => {
-  try {
-    const { entries, latestCommand, serverId, sessionId } = req.body;
-    
-    console.log('[TERMINAL-SUGGEST BACKEND] Received latestCommand:', latestCommand);
-    console.log('[TERMINAL-SUGGEST BACKEND] Received serverId:', serverId, 'sessionId:', sessionId);
-    
-    // If we have serverId and sessionId, fetch session-specific history from database
-    let contextEntries = entries; // fallback to provided entries
-    let actualLatestCommand = latestCommand; // Store the actual latest command
-    
-    if (serverId && sessionId !== null && sessionId !== undefined && !isNaN(sessionId)) {
-      try {
-        // Get unique commands by using GROUP BY and taking the most recent output for each command
-        const sessionHistory = db.prepare(`
-          WITH RankedHistory AS (
-            SELECT 
-              command,
-              output,
-              created_at,
-              ROW_NUMBER() OVER (PARTITION BY command ORDER BY created_at DESC) as rn
-            FROM history 
-            WHERE server_id = ? AND chat_session_id = ?
-          )
-          SELECT command, output, created_at
-          FROM RankedHistory
-          WHERE rn = 1
-          ORDER BY created_at DESC 
-          LIMIT 6
-        `).all(serverId, sessionId);
-        
-        if (sessionHistory.length > 0) {
-          contextEntries = sessionHistory.map(h => ({
-            command: h.command || '',
-            output: (h.output || '').slice(0, 1000)
-          }));
-          // Use the most recent command from database
-          actualLatestCommand = sessionHistory[0]?.command || latestCommand;
-          console.log('[TERMINAL-SUGGEST BACKEND] Using latest command from DB:', actualLatestCommand);
-        }
-      } catch (dbError) {
-        console.error('[TERMINAL-SUGGEST BACKEND] Database error:', dbError);
-      }
-    }
-    
-    console.log('[TERMINAL-SUGGEST BACKEND] Final entries for context:', JSON.stringify(contextEntries, null, 2));
-    console.log('[TERMINAL-SUGGEST BACKEND] Final latest command:', actualLatestCommand);
-
-    // Build prompt for Gemini with enhanced command explanation requirements
-    let prompt = `You are a helpful Linux system administrator assistant. Based on the recent terminal command history below, suggest the next logical command that the user might want to run.
-
-Recent command history (most recent last):
-`;
-
-    // Add commands in chronological order (oldest to newest)
-    const chronologicalEntries = [...contextEntries].reverse();
-    chronologicalEntries.forEach((entry, i) => {
-      const cmd = entry.command || '';
-      const out = entry.output || '';
-      prompt += `\n${i + 1}. Command: ${cmd}\n`;
-      if (out.trim()) {
-        // Look for common error patterns in the output
-        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
-        const outputPrefix = hasError ? 'Error Output' : 'Output';
-        // Increase truncation limit for error messages
-        const truncateLimit = hasError ? 2000 : 1000;
-        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
-        // Format output with proper indentation and line breaks
-        const lines = truncatedOutput.split('\n');
-        const formattedOutput = lines
-          .filter(line => line.trim()) // Remove empty lines
-          .map(line => `   ${line.trim()}`) // Indent each line
-          .join('\n');
-        prompt += `   ${outputPrefix}:\n${formattedOutput}\n`;
-      }
-    });
-
-    prompt += '\n\nBased on this command history, suggest the next logical command that would help the user.';
-
-    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-    if (!GEMINI_API_KEY) {
-      console.error('[TERMINAL-SUGGEST BACKEND] GEMINI_API_KEY not found in environment');
-      return res.status(500).json({ error: 'Gemini API key not configured' });
-    }
-
-    const response = await axios.post(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key=' + GEMINI_API_KEY,
-      {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 8192,  // Increased from 1024 to 8192
-          stopSequences: []
-        }
-      },
-      {
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
-
-    if (response.status !== 200) {
-      console.error('[TERMINAL-SUGGEST BACKEND] Gemini API error:', response.status, response.data);
-      return res.status(500).json({ error: 'Failed to get suggestions from Gemini' });
-    }
-
-    const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    console.log('[TERMINAL-SUGGEST BACKEND] Raw Gemini response:', rawText);
-
-    // Clean and parse the response
-    let cleanedText = rawText.trim();
-    
-    // More robust JSON extraction
-    function extractJSON(text) {
-      // First try to find JSON between code blocks
-      let match = text.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-      if (match) return match[1].trim();
-      
-      // If no code blocks, try to find outermost { }
-      match = text.match(/\{[\s\S]*\}/);
-      if (match) return match[0].trim();
-      
-      // If still no match, return null
-      return null;
-    }
-
-    // Try to extract and parse JSON
-    const jsonText = extractJSON(cleanedText);
-    console.log('[TERMINAL-SUGGEST BACKEND] Extracted JSON:', jsonText);
-    
-    if (!jsonText) {
-      console.error('[TERMINAL-SUGGEST BACKEND] Could not extract JSON from response');
-      // Use fallback
-      const fallbackJson = {
-        answer: "Here are some suggested commands based on your recent activity",
-        commands: ["ls -l", "pwd", "df -h"],
-        explanations: [
-          "List files with details",
-          "Show current directory",
-          "Show disk usage"
-        ]
-      };
-      return res.json({
-        response: fallbackJson.answer,
-        json: fallbackJson,
-        prompt: prompt,
-        error: 'Failed to parse Gemini response, using fallback suggestions'
-      });
-    }
-    
-    try {
-      const parsedJson = JSON.parse(jsonText);
-      
-      // Validate JSON structure
-      if (!parsedJson.answer || !Array.isArray(parsedJson.commands)) {
-        throw new Error('Invalid response format - missing required fields');
-      }
-      
-      // Clean up explanations - ensure they are strings
-      if (Array.isArray(parsedJson.explanations)) {
-        parsedJson.explanations = parsedJson.explanations.map(exp => {
-          if (typeof exp === 'string') return exp;
-          if (typeof exp === 'object') {
-            // If explanation is an object with numbered keys, join the values
-            return Object.values(exp).join(' ');
-          }
-          return String(exp); // Convert any other type to string
-        });
-      }
-      
-      // Ensure explanations exist and match commands length
-      if (!Array.isArray(parsedJson.explanations) || parsedJson.explanations.length !== parsedJson.commands.length) {
-        // Generate basic explanations if missing
-        parsedJson.explanations = parsedJson.commands.map(cmd => {
-          if (cmd.startsWith('ls')) return 'List directory contents with detailed information. This shows file permissions, sizes, and timestamps. Expect a detailed listing of files and directories.';
-          if (cmd.startsWith('cd')) return 'Change directory to explore contents. This moves you into the specified directory. Expect to be in the new directory after execution.';
-          if (cmd.startsWith('ps')) return 'Show running processes and their status. This displays information about active processes. Expect a list of processes with details like CPU and memory usage.';
-          if (cmd.startsWith('top')) return 'Monitor system processes in real-time. This shows a dynamic view of system resource usage. Expect an interactive display of process information that updates regularly.';
-          if (cmd.startsWith('df')) return 'Show disk space usage. This displays filesystem space utilization. Expect a list of mounted filesystems with their total, used, and available space.';
-          if (cmd.startsWith('du')) return 'Show directory space usage. This calculates disk usage of directories. Expect a list of directories with their total sizes.';
-          return `Execute the ${cmd} command. This will run in your current shell context. Check the output carefully before running any further commands.`;
-        });
-      }
-      
-      res.json({
-        response: parsedJson.answer,
-        json: parsedJson,
-        prompt: prompt
-      });
-    } catch (parseError) {
-      console.error('[TERMINAL-SUGGEST BACKEND] JSON parse error:', parseError, 'jsonText:', jsonText);
-      
-      // Try to salvage partial response if possible
-      const commandMatch = jsonText.match(/"commands":\s*\[(.*?)\]/s);
-      const answerMatch = jsonText.match(/"answer":\s*"([^"]+)"/);
-      
-      const salvaged = {
-        answer: answerMatch ? answerMatch[1] : "Here are some suggested commands based on your recent activity",
-        commands: commandMatch ? 
-          commandMatch[1].split(',')
-            .map(s => s.trim().replace(/^"|"$/g, ''))
-            .filter(s => s && !s.includes('"')) : 
-          ["ls -l", "pwd", "df -h"],
-        explanations: ["List files with details", "Show current directory", "Show disk usage"]
-      };
-      
-      res.json({
-        response: salvaged.answer,
-        json: salvaged,
-        prompt: prompt,
-        error: 'Partial parse of Gemini response'
-      });
-    }
-    
-  } catch (error) {
-    console.error('[TERMINAL-SUGGEST BACKEND] Error:', error?.response?.data || error);
-    res.status(500).json({ 
-      error: 'Failed to get suggestions',
-      details: error?.response?.data?.error || error.message
-    });
-  }
-});
-
-// --- Alternative Terminal Suggestion Endpoint (Gemini Flash) ---
-// Accepts up to 6 recent terminal entries for context
-app.post('/api/ai/terminal-suggest-alt', async (req, res) => {
-  const { entries, previousSuggestion } = req.body;
-  function escapeForPrompt(str) {
-    if (!str || typeof str !== 'string') return 'N/A';
-    return str.replace(/[`$\\]/g, match => '\\' + match).replace(/\u0000/g, '');
-  }
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    const geminiModel = 'gemini-2.5-flash-preview-04-17';
-    let prompt = '';
-    if (Array.isArray(entries) && entries.length > 0 && previousSuggestion) {
-      prompt = 'The user just ran these recent commands in the terminal (oldest to newest):\n';
-      // Show commands in chronological order
-      const chronologicalEntries = [...entries].reverse();
-      chronologicalEntries.forEach((e, idx) => {
-        const cmd = escapeForPrompt(e.command);
-        const out = escapeForPrompt(e.output);
-        // Look for common error patterns in the output
-        const hasError = /error|not found|invalid|cannot|failed|denied|permission|no such/i.test(out);
-        const outputPrefix = hasError ? 'Error Output:' : 'Output:';
-        // Increase truncation limit for error messages
-        const truncateLimit = hasError ? 2000 : 1000;
-        const truncatedOutput = out.length > truncateLimit ? out.substring(0, truncateLimit) + '...' : out;
-        prompt += `\n${idx + 1}. $ ${cmd}\n   ${outputPrefix} ${truncatedOutput}`;
-      });
-      const prev = typeof previousSuggestion === 'object' ? JSON.stringify(previousSuggestion.json || previousSuggestion.response || previousSuggestion) : escapeForPrompt(previousSuggestion);
-      prompt += `\n\nThe previous suggestion was: ${prev}\n`;
-      prompt += `\nBased on the most recent command "${escapeForPrompt(entries[0]?.command || '')}" and its output, suggest an alternative next best command or troubleshooting step. If you see any errors in the output, suggest commands that would help fix those errors or provide alternatives that would work better.
-
-Provide your response as a JSON object with:
-- "answer": A brief explanation of what the suggested command does, mentioning any errors seen and how to fix them
-- "commands": An array of 1-3 suggested commands (just the command strings)
-- "explanations": An array of strings, where each string explains the corresponding command in the commands array. Each explanation should describe:
-  1. What the command does
-  2. Why it's relevant after the previous command (especially if fixing an error)
-  3. What output to expect
-  4. Any potential errors to watch out for and how to handle them
-
-Do not repeat the previous suggestion's commands.`;
-    } else {
-      return res.status(400).json({ error: 'Missing entries or previousSuggestion' });
-    }
-    const geminiMessages = [
-      {
-        role: 'user',
-        parts: [{ text: prompt }]
-      }
-    ];
-    const geminiPayload = {
-      contents: geminiMessages,
-      generationConfig: {
-        temperature: 0.7,
-        topK: 40,
-        topP: 0.95,
-        maxOutputTokens: 8192,  // Increased from 1024 to 8192
-        stopSequences: []
-      }
-    };
-    let response;
-    let aiResponse = '';
-    let aiJson = null;
-    try {
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        geminiPayload
-      );
-      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      try {
-        aiJson = JSON.parse(cleanAIResponse(aiResponse));
-      } catch (e) {
-        aiJson = null;
-      }
-    } catch (err) {
-      // If the API errors, try again without responseMimeType
-      geminiPayload = { 
-        contents: geminiMessages,
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 8192,  // Increased here too
-          stopSequences: []
-        }
-      };
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=` + geminiApiKey,
-        geminiPayload
-      );
-      aiResponse = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      try {
-        aiJson = JSON.parse(cleanAIResponse(aiResponse));
-      } catch (e) {
-        aiJson = null;
-      }
-    }
-    res.json({
-      response: aiResponse,
-      json: aiJson,
-      model: 'gemini',
-      created_at: new Date().toISOString(),
-      prompt: prompt
-    });
-  } catch (err) {
-    console.error('Terminal Alternative Suggestion error:', err);
-    res.status(500).json({ error: err.message || 'Unknown server error', details: err.response?.data || null });
-  }
-});
-
 // List chat sessions for a server (by date or session)
 app.get('/api/servers/:id/chat-sessions', (req, res) => {
   const serverId = parseInt(req.params.id);
@@ -1375,6 +1009,7 @@ wss.on('connection', (ws, req) => {
                 console.log(`[TERMINAL] Logged command "${cleanCommand}" with output length ${commandOutput.length}`);
               } catch (error) {
                 console.error('[TERMINAL] Failed to log command:', error);
+                ws.send(`\r\n\x1b[31m[Error: Failed to log command - ${error.message}]\x1b[0m\r\n`);
               }
             }
             

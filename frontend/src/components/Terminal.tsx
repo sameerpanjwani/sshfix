@@ -53,14 +53,35 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
   useEffect(() => {
     const term = new XTerm({
       cursorBlink: true,
-      fontFamily: 'monospace',
-      fontSize: 15,
-      theme: { background: '#181818', foreground: '#e0e0e0' },
+      fontFamily: 'Consolas, monospace',
+      fontSize: 14,
+      theme: {
+        background: '#181818',
+        foreground: '#e0e0e0',
+        cursor: '#ffffff',
+        black: '#000000',
+        red: '#e06c75',
+        green: '#98c379',
+        yellow: '#d19a66',
+        blue: '#61afef',
+        magenta: '#c678dd',
+        cyan: '#56b6c2',
+        white: '#abb2bf',
+        brightBlack: '#5c6370',
+        brightRed: '#e06c75',
+        brightGreen: '#98c379',
+        brightYellow: '#d19a66',
+        brightBlue: '#61afef',
+        brightMagenta: '#c678dd',
+        brightCyan: '#56b6c2',
+        brightWhite: '#ffffff'
+      },
       rows: 24,
       cols: 80,
       convertEol: true,
       cursorStyle: 'block',
-      scrollback: 1000
+      scrollback: 1000,
+      allowTransparency: true
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -244,7 +265,15 @@ const InteractiveTerminal: React.FC<TerminalProps> = ({ serverId, quickCommand, 
     <div 
       ref={containerRef} 
       id="xterm-container" 
-      style={{ width: '100%', height: '100%', background: '#181818', borderRadius: 12, overflow: 'hidden' }}
+      style={{ 
+        width: '100%', 
+        height: '100%', 
+        background: '#181818', 
+        borderRadius: 12, 
+        overflow: 'hidden',
+        padding: '0 16px',
+        textAlign: 'left'
+      }}
       onClick={handleContainerClick}
       onFocus={() => xtermRef.current?.focus()}
       tabIndex={-1}

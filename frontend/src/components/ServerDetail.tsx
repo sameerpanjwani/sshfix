@@ -235,7 +235,7 @@ const ServerDetail: React.FC = () => {
         console.log('[ServerDetail.tsx] Entries:', entriesForSuggestion);
         
         // Call suggestion API
-        const response = await axios.post(baseUrl + '/api/ai/terminal-suggest', {
+        const response = await axios.post(baseUrl + '/api/terminal/suggest', {
           entries: entriesForSuggestion,
           latestCommand,
           serverId: Number(id),
@@ -298,8 +298,22 @@ const ServerDetail: React.FC = () => {
       </div>
       {/* Main Area */}
       <div style={{ display: 'flex', gap: 0, flexWrap: 'wrap', minHeight: PANEL_HEIGHT, height: PANEL_HEIGHT }}>
-        {/* Chat (Left) */}
-        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #f0f0f0', padding: 32, background: '#f5f7fa', borderBottomLeftRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
+        {/* Terminal (Left) */}
+        <div style={{ flex: 1, minWidth: 340, borderRight: '1px solid #2a2a2a', padding: '16px 0', background: '#181818', borderBottomLeftRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
+          <InteractiveTerminal
+            serverId={Number(id)}
+            panelHeight={PANEL_HEIGHT}
+            quickCommand={pendingTerminalCommand || quickCommand}
+            onQuickCommandUsed={() => {
+              setPendingTerminalCommand(null);
+              setQuickCommand(null);
+            }}
+            onHistoryUpdate={handleHistoryUpdate}
+            clearSignal={terminalClearSignal}
+          />
+        </div>
+        {/* Chat (Right) */}
+        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#f5f7fa', borderBottomRightRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
           <Chat
             onQuickCommand={handleQuickCommand}
             panelHeight={PANEL_HEIGHT}
@@ -312,20 +326,6 @@ const ServerDetail: React.FC = () => {
             setGeminiSuggestions={setGeminiSuggestions}
             currentChatSessionId={currentChatSessionId?.toString() || null}
             onStartNewSession={handleStartNewChatSession}
-          />
-        </div>
-        {/* Terminal (Right) */}
-        <div style={{ flex: 1, minWidth: 340, padding: 32, background: '#181818', borderBottomRightRadius: 16, height: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column' }}>
-          <InteractiveTerminal
-            serverId={Number(id)}
-            panelHeight={PANEL_HEIGHT}
-            quickCommand={pendingTerminalCommand || quickCommand}
-            onQuickCommandUsed={() => {
-              setPendingTerminalCommand(null);
-              setQuickCommand(null);
-            }}
-            onHistoryUpdate={handleHistoryUpdate}
-            clearSignal={terminalClearSignal}
           />
         </div>
       </div>

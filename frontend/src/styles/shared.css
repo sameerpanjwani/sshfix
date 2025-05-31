@@ -30,6 +30,11 @@ body {
   text-align: center;
 }
 
+/* Terminal specific styles */
+#xterm-container {
+  text-align: left !important;
+}
+
 /* Container */
 .container {
   max-width: 1200px;
